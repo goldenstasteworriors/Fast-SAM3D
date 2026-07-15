@@ -684,6 +684,28 @@ class HistoryMemoryPosePrior:
                     if translation_error > 0.30 or rotation_error > np.deg2rad(100.0):
                         diagnostics["failure"] = "rgbd_fit_rejected_as_implausible"
                     else:
+                        inlier_ratio = inlier_count / max(int(canonical.shape[0]), 1)
+                        support = min(
+                            inlier_count / max(2.0 * self.min_matches, 1.0), 1.0
+                        )
+                        blend_weight = float(
+                            np.clip(inlier_ratio * support, 0.15, 0.60)
+                        )
+                        # EgoAERO includes E_pose to keep sparse RGB-D matches
+                        # from producing a large update.  Apply the equivalent
+                        # regularization by blending the raw fit with the
+                        # chained coarse pose according to RANSAC support.
+                        pose = blend_poses(coarse_pose, pose, blend_weight)
+                        final_translation_error, final_rotation_error = pose_errors(
+                            pose, coarse_pose
+                        )
+                        diagnostics["rgbd_fit_blend_weight"] = blend_weight
+                        diagnostics["regularized_translation_delta"] = (
+                            final_translation_error
+                        )
+                        diagnostics["regularized_rotation_delta_deg"] = float(
+                            np.rad2deg(final_rotation_error)
+                        )
                         context = {
                             "canonical_points": canonical[inliers],
                             "current_points": current[inliers],
