@@ -35,6 +35,11 @@ Usage:
     optionally:
     --rotvel_json /path/to/video_dir/426_motion_stats.json
 
+    Occlusion-aware render IoU scoring (comma-separated names support both hands):
+    --occluder_masks_root /path/to/hand_segmentation_review/masks \
+    --occluder_mask_names right_hand_sam3 \
+    --occluder_dilation_px 5
+
     With pose_log_likelihood selection (selects pose with highest log p(pose | shape, image)):
     python track_object.py \
     --config checkpoints/hf/pipeline.yaml \
@@ -69,6 +74,7 @@ sys.path.insert(0, project_root)
 sys.path.insert(0, os.path.join(project_root, "notebook"))
 
 import argparse
+import cv2
 import glob
 import json
 import time
@@ -295,15 +301,83 @@ def _render_silhouette(mesh, pose_dict, intrinsics_3x3, width, height, device, r
     return alpha
 
 
-def compute_render_iou(mesh, pose_dict, intrinsics_3x3, gt_mask, width, height, device, renderer=None):
-    alpha = _render_silhouette(mesh, pose_dict, intrinsics_3x3, width, height, device, renderer=renderer)
-    render_binary = alpha > 0.5
-    gt_binary = gt_mask > 0
-    intersection = (render_binary & gt_binary).sum()
-    union = (render_binary | gt_binary).sum()
+def _compute_binary_iou(render_binary, gt_binary, valid_mask=None):
+    render_binary = np.asarray(render_binary, dtype=bool)
+    gt_binary = np.asarray(gt_binary, dtype=bool)
+    if valid_mask is None:
+        valid_mask = np.ones_like(render_binary, dtype=bool)
+    else:
+        valid_mask = np.asarray(valid_mask, dtype=bool)
+
+    intersection = (render_binary & gt_binary & valid_mask).sum()
+    union = ((render_binary | gt_binary) & valid_mask).sum()
     if union == 0:
         return 0.0
     return float(intersection) / float(union)
+
+
+def compute_render_iou(
+    mesh,
+    pose_dict,
+    intrinsics_3x3,
+    gt_mask,
+    width,
+    height,
+    device,
+    renderer=None,
+    occluder_mask=None,
+    occluder_dilation_px=0,
+    return_details=False,
+):
+    alpha = _render_silhouette(mesh, pose_dict, intrinsics_3x3, width, height, device, renderer=renderer)
+    render_binary = alpha > 0.5
+    gt_binary = gt_mask > 0
+    raw_iou = _compute_binary_iou(render_binary, gt_binary)
+
+    score_iou = raw_iou
+    occlusion_applied = False
+    ignored_gt_fraction = 0.0
+    visible_render_fraction = 1.0
+    occluder_pixels = 0
+
+    if occluder_mask is not None:
+        occluder_binary = np.asarray(occluder_mask) > 0
+        if occluder_binary.shape != gt_binary.shape:
+            occluder_binary = cv2.resize(
+                occluder_binary.astype(np.uint8),
+                (gt_binary.shape[1], gt_binary.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            ).astype(bool)
+        if occluder_dilation_px > 0:
+            kernel_size = 2 * int(occluder_dilation_px) + 1
+            kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+            occluder_binary = cv2.dilate(
+                occluder_binary.astype(np.uint8), kernel, iterations=1,
+            ).astype(bool)
+
+        occluder_pixels = int(occluder_binary.sum())
+        valid_mask = ~occluder_binary
+        valid_union = ((render_binary | gt_binary) & valid_mask).sum()
+        if valid_union > 0:
+            score_iou = _compute_binary_iou(render_binary, gt_binary, valid_mask)
+            occlusion_applied = True
+
+        gt_pixels = int(gt_binary.sum())
+        if gt_pixels > 0:
+            ignored_gt_fraction = float((gt_binary & occluder_binary).sum()) / float(gt_pixels)
+        render_pixels = int(render_binary.sum())
+        if render_pixels > 0:
+            visible_render_fraction = float((render_binary & valid_mask).sum()) / float(render_pixels)
+
+    details = {
+        "score_iou": score_iou,
+        "raw_iou": raw_iou,
+        "occlusion_applied": occlusion_applied,
+        "ignored_gt_fraction": ignored_gt_fraction,
+        "visible_render_fraction": visible_render_fraction,
+        "occluder_pixels": occluder_pixels,
+    }
+    return details if return_details else score_iou
 
 
 # ------------------------------------------------------------------
@@ -1052,6 +1126,8 @@ def guided_predict_pose(
     scoring_metric="shape_iou",
     render_mesh=None,
     gt_mask=None,
+    occluder_mask=None,
+    occluder_dilation_px=0,
     image_hw=None,
     enable_shape_icp=True,
     pose_selection="greedy",
@@ -1184,11 +1260,19 @@ def guided_predict_pose(
                     "translation": result["translation"],
                     "scale": result["scale"],
                 }
-            riou = compute_render_iou(
+            riou_details = compute_render_iou(
                 render_mesh, pose_for_render, intrinsics.squeeze(),
                 gt_mask, W, H, device, renderer=frame_renderer,
+                occluder_mask=occluder_mask,
+                occluder_dilation_px=occluder_dilation_px,
+                return_details=True,
             )
-            result["render_iou"] = riou
+            result["render_iou"] = riou_details["score_iou"]
+            result["render_iou_raw"] = riou_details["raw_iou"]
+            result["occlusion_applied"] = riou_details["occlusion_applied"]
+            result["occlusion_ignored_gt_fraction"] = riou_details["ignored_gt_fraction"]
+            result["occlusion_visible_render_fraction"] = riou_details["visible_render_fraction"]
+            result["occluder_pixels"] = riou_details["occluder_pixels"]
 
         # Score selection
         if scoring_metric == "render_iou" and "render_iou" in result:
@@ -1482,6 +1566,24 @@ def process_video(args):
     init_frame = args.init_frame
 
     masks_root = args.masks_root if args.masks_root else os.path.join(args.vid_dir, "video_segmentation", "masks")
+    occluder_mask_names = [
+        name.strip() for name in (args.occluder_mask_names or "").split(",")
+        if name.strip()
+    ]
+    if bool(args.occluder_masks_root) != bool(occluder_mask_names):
+        logger.error("--occluder_masks_root and --occluder_mask_names must be provided together")
+        return
+    if args.occluder_masks_root and not os.path.isdir(args.occluder_masks_root):
+        logger.error(f"Occluder masks root not found: {args.occluder_masks_root}")
+        return
+    if args.occluder_dilation_px < 0:
+        logger.error("--occluder_dilation_px must be non-negative")
+        return
+    if occluder_mask_names:
+        logger.info(
+            f"Occlusion-aware render IoU: root={args.occluder_masks_root}, "
+            f"names={occluder_mask_names}, dilation={args.occluder_dilation_px}px"
+        )
     if args.mesh:
         mesh_path = args.mesh
     else:
@@ -1734,6 +1836,38 @@ def process_video(args):
             logger.warning(f"  Frame {frame_idx}: empty mask -- skipping, reusing previous pose target")
             return None
 
+        occluder_mask = None
+        if occluder_mask_names:
+            combined_occluder = np.zeros_like(mask, dtype=bool)
+            found_occluders = []
+            for occluder_name in occluder_mask_names:
+                occluder_path = os.path.join(
+                    args.occluder_masks_root,
+                    f"frame_{frame_idx:06d}_masks",
+                    f"{occluder_name}.png",
+                )
+                if not os.path.isfile(occluder_path):
+                    continue
+                frame_occluder = load_mask(occluder_path) > 0
+                if frame_occluder.shape != mask.shape:
+                    frame_occluder = cv2.resize(
+                        frame_occluder.astype(np.uint8),
+                        (mask.shape[1], mask.shape[0]),
+                        interpolation=cv2.INTER_NEAREST,
+                    ).astype(bool)
+                combined_occluder |= frame_occluder
+                found_occluders.append(occluder_name)
+            if found_occluders:
+                occluder_mask = combined_occluder
+                logger.info(
+                    f"  Occluder masks: {found_occluders}, "
+                    f"pixels={int(occluder_mask.sum())} before dilation"
+                )
+            else:
+                logger.warning(
+                    f"  Frame {frame_idx}: no occluder masks found; using raw render IoU"
+                )
+
         rgba = np.concatenate(
             [image[..., :3], (mask.astype(np.uint8) * 255)[..., None]], axis=-1
         )
@@ -1774,6 +1908,8 @@ def process_video(args):
             scoring_metric=args.scoring_metric,
             render_mesh=render_mesh,
             gt_mask=mask,
+            occluder_mask=occluder_mask,
+            occluder_dilation_px=args.occluder_dilation_px,
             image_hw=image_hw,
             enable_shape_icp=args.enable_shape_icp,
             pose_selection=args.pose_selection,
@@ -1818,7 +1954,14 @@ def process_video(args):
         if "post_opt_iou" in result:
             msg += f", post_opt_IoU={result['post_opt_iou']:.4f}"
         if "render_iou" in result:
-            msg += f", render_IoU={result['render_iou']:.4f}"
+            if result.get("occlusion_applied", False):
+                msg += (
+                    f", render_IoU(raw->visible)={result['render_iou_raw']:.4f}"
+                    f"->{result['render_iou']:.4f}, "
+                    f"ignored_gt={100.0 * result['occlusion_ignored_gt_fraction']:.1f}%"
+                )
+            else:
+                msg += f", render_IoU={result['render_iou']:.4f}"
         logger.info(msg)
 
         all_results[frame_idx] = result
@@ -1899,6 +2042,9 @@ def process_video(args):
         "pose_sde_strength": args.pose_sde_strength,
         "num_pose_samples": args.num_pose_samples,
         "scoring_metric": args.scoring_metric,
+        "occluder_masks_root": args.occluder_masks_root,
+        "occluder_mask_names": occluder_mask_names,
+        "occluder_dilation_px": args.occluder_dilation_px,
         "pose_selection": args.pose_selection,
         "cluster_dist_thresh": args.cluster_dist_thresh if args.pose_selection == "cluster" else None,
         "cluster_min_size": args.cluster_min_size if args.pose_selection == "cluster" else None,
@@ -1938,6 +2084,12 @@ def main():
     parser.add_argument("--object_name", required=True, help="Object name (e.g. bottle_0)")
     parser.add_argument("--masks_root", default=None,
                         help="Override masks root directory. Default: <vid_dir>/video_segmentation/masks")
+    parser.add_argument("--occluder_masks_root", default=None,
+                        help="Per-frame occluder mask root, using frame_XXXXXX_masks/<name>.png")
+    parser.add_argument("--occluder_mask_names", default=None,
+                        help="Comma-separated occluder mask names used as ignored regions for render IoU")
+    parser.add_argument("--occluder_dilation_px", type=int, default=0,
+                        help="Dilate combined occluder mask by this many pixels before render IoU scoring")
     parser.add_argument("--mesh", default=None, help="Override init mesh path")
     parser.add_argument("--output_dir", default="guided_pose_output", help="Output directory")
     parser.add_argument("--device", default="cuda", help="Device")
