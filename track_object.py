@@ -2303,6 +2303,10 @@ def process_video(args):
             and all(key in pose_target for key in ("rotation", "translation", "scale"))
             else None
         )
+        hand_prior_in_range = (
+            (args.hand_prior_start_frame is None or frame_idx >= args.hand_prior_start_frame)
+            and (args.hand_prior_end_frame is None or frame_idx < args.hand_prior_end_frame)
+        )
         if args.pose_prior_mode == "hand":
             prior_pose, pose_prior_diagnostics = pose_prior_provider.get_pose(frame_idx)
             if prior_pose is not None:
@@ -2328,6 +2332,16 @@ def process_video(args):
                 frame_pose_target = prior_pose
                 candidate_pose_prior = prior_pose
                 candidate_pose_priors = [prior_pose]
+        elif args.pose_prior_mode in _NEW_HAND_PRIOR_MODES and not hand_prior_in_range:
+            pose_prior_diagnostics = {
+                "mode": args.pose_prior_mode,
+                "active": False,
+                "reason": "outside_hand_interaction_range",
+                "active_range": [
+                    args.hand_prior_start_frame,
+                    args.hand_prior_end_frame,
+                ],
+            }
         elif args.pose_prior_mode == "hand_motion":
             prior_pose, priors, pose_prior_diagnostics = (
                 hand_motion_provider.estimate(frame_idx, decoded_coarse_pose)
@@ -2650,6 +2664,10 @@ def process_video(args):
             args.hand_grasp_type if args.pose_prior_mode in _NEW_HAND_PRIOR_MODES else None
         ),
         "hand_multimodal_guidance": args.hand_multimodal_guidance,
+        "hand_prior_range": [
+            args.hand_prior_start_frame,
+            args.hand_prior_end_frame,
+        ],
         "hand_memory_pool": hand_memory_pool_summary,
         "prior_translation_score_weight": args.prior_translation_score_weight,
         "prior_rotation_score_weight": args.prior_rotation_score_weight,
@@ -2765,6 +2783,10 @@ def main():
     parser.add_argument("--hand_grasp_type", default="auto",
                         choices=["auto", "grab", "clip", "pinch", "power_hold"],
                         help="Automatic or forced grasp-category geometric reference")
+    parser.add_argument("--hand_prior_start_frame", type=int, default=None,
+                        help="First frame of the hand-interaction segment (inclusive)")
+    parser.add_argument("--hand_prior_end_frame", type=int, default=None,
+                        help="End of the hand-interaction segment (exclusive)")
     parser.add_argument("--hand_coarse_blend_weight", type=float, default=0.0,
                         help="Blend hand-motion target toward the chained SAM3D pose")
     parser.add_argument("--hand_multimodal_guidance", action=argparse.BooleanOptionalAction,

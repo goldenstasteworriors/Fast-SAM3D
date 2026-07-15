@@ -237,6 +237,10 @@ used for final scoring: `--hand_multimodal_guidance` distributes diffusion
 samples round-robin across them. This is important when unguided SAM3D fails to
 generate any correct candidate under heavy occlusion.
 
+For a full timeline, limit these constraints to the actual hand-interaction
+segment with `--hand_prior_start_frame` / `--hand_prior_end_frame`; frames
+outside that interval fall back to ordinary image-conditioned pose chaining.
+
 Example for a left-hand power hold with a four-frame contact window:
 
 ```bash
