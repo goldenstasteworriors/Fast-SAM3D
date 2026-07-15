@@ -827,12 +827,30 @@ def batched_guided_sample_sparse_structure(
     if chunk_size is None:
         chunk_size = K
 
-    # Resolve pose target to latent dict (shared across all samples)
+    # Resolve one or more pose targets.  Multiple hand/grasp hypotheses are
+    # assigned round-robin so guided diffusion actually generates candidates
+    # around every mode instead of only using extra modes during ranking.
     pose_target_latent = None
+    pose_target_count = 0
     if max(alpha_pose, alpha_pose_translation, alpha_pose_scale) > 0 and pose_target is not None:
-        pose_target_latent = _prepare_pose_target_latent(
-            pose_target, ss_input_dict, device,
+        pose_targets = (
+            list(pose_target)
+            if isinstance(pose_target, (list, tuple))
+            else [pose_target]
         )
+        pose_target_count = len(pose_targets)
+        latent_targets = [
+            _prepare_pose_target_latent(target, ss_input_dict, device)
+            for target in pose_targets
+        ]
+        assignments = [index % pose_target_count for index in range(K)]
+        pose_target_latent = {
+            key: torch.cat(
+                [latent_targets[target_index][key] for target_index in assignments],
+                dim=0,
+            )
+            for key in _POSE_LATENT_KEYS
+        }
 
     # Embed conditions ONCE at batch=1, then expand per chunk
     with torch.no_grad():
@@ -872,6 +890,8 @@ def batched_guided_sample_sparse_structure(
                 "alpha_pose="
                 f"R{alpha_pose:.2f}/T{alpha_pose_translation:.2f}/S{alpha_pose_scale:.2f}"
             )
+            if pose_target_count > 1:
+                parts.append(f"pose_modes={pose_target_count}")
         if pose_sde_strength > 0:
             parts.append(f"pose_sde={pose_sde_strength:.3f}")
         if _is_faster_gen:
@@ -950,7 +970,9 @@ def batched_guided_sample_sparse_structure(
                             )
                             if alpha_key <= 0:
                                 continue
-                            pt = pose_target_latent[k].expand(chunk_K, -1, -1).to(x_next[k].dtype)
+                            pt = pose_target_latent[k][chunk_start:chunk_end].to(
+                                x_next[k].dtype
+                            )
                             z_ref_pose = (1.0 - t_next) * pose_noise[k] + t_next * pt
                             x_next[k] = (1.0 - alpha_key) * x_next[k] + alpha_key * z_ref_pose
 
@@ -2364,6 +2386,17 @@ def process_video(args):
                 candidate_pose_prior = prior_pose
                 candidate_pose_priors = priors or [prior_pose]
 
+        if (
+            args.hand_multimodal_guidance
+            and candidate_pose_priors is not None
+            and len(candidate_pose_priors) > 1
+            and args.pose_prior_mode in _NEW_HAND_PRIOR_MODES
+        ):
+            frame_pose_target = candidate_pose_priors
+            pose_prior_diagnostics["diffusion_pose_hypotheses"] = len(
+                candidate_pose_priors
+            )
+
         if args.pose_prior_mode != "none":
             logger.info(
                 "  Pose prior: "
@@ -2616,6 +2649,7 @@ def process_video(args):
         "hand_grasp_type": (
             args.hand_grasp_type if args.pose_prior_mode in _NEW_HAND_PRIOR_MODES else None
         ),
+        "hand_multimodal_guidance": args.hand_multimodal_guidance,
         "hand_memory_pool": hand_memory_pool_summary,
         "prior_translation_score_weight": args.prior_translation_score_weight,
         "prior_rotation_score_weight": args.prior_rotation_score_weight,
@@ -2733,6 +2767,9 @@ def main():
                         help="Automatic or forced grasp-category geometric reference")
     parser.add_argument("--hand_coarse_blend_weight", type=float, default=0.0,
                         help="Blend hand-motion target toward the chained SAM3D pose")
+    parser.add_argument("--hand_multimodal_guidance", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Distribute diffusion candidates across all hand/grasp pose hypotheses")
     parser.add_argument("--hand_memory_start_frame", type=int, default=0)
     parser.add_argument("--hand_memory_end_frame", type=int, default=None)
     parser.add_argument("--hand_memory_pool_size", type=int, default=32)

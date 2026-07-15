@@ -232,6 +232,11 @@ fallback.
   canonical-object-vertex distance signatures.
 - `hand_fusion`: grasp memory guidance with category-axis and contact scoring.
 
+By default, top-K memory poses and symmetry-equivalent grasp poses are not only
+used for final scoring: `--hand_multimodal_guidance` distributes diffusion
+samples round-robin across them. This is important when unguided SAM3D fails to
+generate any correct candidate under heavy occlusion.
+
 Example for a left-hand power hold with a four-frame contact window:
 
 ```bash
