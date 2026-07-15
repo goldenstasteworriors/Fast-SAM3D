@@ -176,10 +176,10 @@ rm -rf checkpoints/${TAG}-download
 
 ### Occlusion-robust video pose priors
 
-`track_object.py` supports two optional priors for frames where the object is
-strongly occluded. Both keep the original image-conditioned diffusion and
-render-IoU evidence; the prior is injected into diffusion and candidate
-ranking as a soft constraint.
+`track_object.py` supports optional priors for frames where the object is
+strongly occluded. They keep the original image-conditioned diffusion and
+occlusion-aware render-IoU evidence; priors are injected into diffusion and
+candidate ranking as soft constraints.
 
 The hand mode anchors a reliable grasp frame and propagates the hand--object
 relative rotation with HaWoR. Translation guidance is disabled by default in
@@ -213,6 +213,45 @@ python track_object.py ... \
     --history_pool_size 24 \
     --history_max_keyframes 4 \
     --history_alignment_score_weight 0.2
+```
+
+The newer hand-aware modes require a camera-space MANO archive. When HaWoR
+stores chunk-local arrays, include `frame_indices` in the NPZ so video frame
+numbers can be resolved. MANO depth is aligned to MoGe from projected hand
+vertices, the hand mask, and point maps; `--hand_coordinate_scale` is only a
+fallback.
+
+- `hand_motion`: robust rigid motion of category-dependent contact joints from
+  a reliable anchor frame.
+- `hand_memory`: retrieve low-occlusion historical frames by normalized MANO
+  articulation and propagate the top-K hypotheses independently.
+- `grasp_type`: the explicit `grab`, `clip`, `pinch`, or `power_hold` geometric
+  reference. For a power hold it constrains the object's main axis to the
+  wrist-to-finger tube while keeping axial symmetry multimodal.
+- `hand_contact`: `hand_motion` plus COP-style invariance of contact-joint to
+  canonical-object-vertex distance signatures.
+- `hand_fusion`: grasp memory guidance with category-axis and contact scoring.
+
+Example for a left-hand power hold with a four-frame contact window:
+
+```bash
+python track_object.py ... \
+    --pose_prior_mode hand_fusion \
+    --pose_archive /path/to/baseline/guided_poses.pt \
+    --hand_meshes /path/to/left_hand_camera.npz \
+    --hand_side left \
+    --hand_anchor_frame 197 \
+    --hand_pointmap_dir /path/to/all_frames \
+    --hand_mask_name right_hand_sam3 \
+    --hand_grasp_type auto \
+    --hand_memory_start_frame 120 \
+    --hand_memory_end_frame 198 \
+    --contact_reference_frames 194,195,196,197 \
+    --pose_guidance_strength 0.55 \
+    --pose_translation_guidance_strength 0.25 \
+    --prior_rotation_score_weight 0.08 \
+    --contact_consistency_score_weight 0.20 \
+    --grasp_axis_score_weight 0.10
 ```
 
 ### Quick Start/Object Generation

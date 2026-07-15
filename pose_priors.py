@@ -10,6 +10,16 @@ Two priors are implemented:
   keyframe memory pool.  It keeps low-occlusion RGB-D observations, matches
   them to the current frame, lifts matches to 3D, and estimates the current
   object pose while historical poses remain fixed.
+* ``HandMotionPosePrior`` propagates an object from a reliable frame with the
+  rigid component of the active contact joints rather than assuming a fixed
+  palm--object transform.
+* ``GraspMemoryPosePrior`` retrieves hand-articulation-matched, low-occlusion
+  historical poses and keeps their propagated hypotheses multimodal.
+* ``GraspTypePosePrior`` implements category-specific geometric references for
+  pinch, clip, multi-finger grab and power hold.
+* ``ContactConsistencyPrior`` implements a lightweight COP-style constraint:
+  distances from contact joints to canonical object vertices should remain
+  stable over a short grasp window.
 
 The module deliberately contains no SAM3D-specific model code, which makes
 the geometry independently testable.
@@ -19,7 +29,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import cv2
 import numpy as np
@@ -29,6 +39,15 @@ from scipy.spatial.transform import Rotation, Slerp
 
 POSE_KEYS = ("rotation", "translation", "scale")
 _MCP_INDICES = np.array([5, 9, 13, 17], dtype=np.int64)
+_FINGER_CHAINS = {
+    "thumb": np.array([1, 2, 3, 4], dtype=np.int64),
+    "index": np.array([5, 6, 7, 8], dtype=np.int64),
+    "middle": np.array([9, 10, 11, 12], dtype=np.int64),
+    "ring": np.array([13, 14, 15, 16], dtype=np.int64),
+    "pinky": np.array([17, 18, 19, 20], dtype=np.int64),
+}
+_FINGER_NAMES = tuple(_FINGER_CHAINS)
+_TIP_INDICES = np.array([4, 8, 12, 16, 20], dtype=np.int64)
 
 
 def _torch_load(path: str | Path) -> Any:
@@ -760,3 +779,912 @@ def history_alignment_score(
     median = float(np.median(residual))
     score = float(np.exp(-median / max(float(sigma), 1e-8)))
     return score, median
+
+
+# ---------------------------------------------------------------------------
+# MANO hand sequence shared by the contact-aware priors
+# ---------------------------------------------------------------------------
+
+
+def _safe_unit(vector: np.ndarray) -> np.ndarray | None:
+    vector = np.asarray(vector, dtype=np.float64)
+    norm = float(np.linalg.norm(vector))
+    if norm < 1e-8 or not np.isfinite(norm):
+        return None
+    return vector / norm
+
+
+def _make_frame(
+    origin: np.ndarray,
+    first_axis: np.ndarray,
+    second_axis: np.ndarray,
+) -> np.ndarray | None:
+    """Create a right-handed frame while keeping ``first_axis`` unchanged."""
+    first = _safe_unit(first_axis)
+    if first is None:
+        return None
+    second = np.asarray(second_axis, dtype=np.float64)
+    second = second - first * float(np.dot(first, second))
+    second = _safe_unit(second)
+    if second is None:
+        return None
+    third = _safe_unit(np.cross(first, second))
+    if third is None:
+        return None
+    second = np.cross(third, first)
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = np.stack([first, second, third], axis=1)
+    transform[:3, 3] = np.asarray(origin, dtype=np.float64)
+    return transform
+
+
+def _align_vectors(source: np.ndarray, target: np.ndarray) -> np.ndarray:
+    """Smallest proper rotation taking one unit vector to another."""
+    source_unit = _safe_unit(source)
+    target_unit = _safe_unit(target)
+    if source_unit is None or target_unit is None:
+        return np.eye(3, dtype=np.float64)
+    cross = np.cross(source_unit, target_unit)
+    sine = float(np.linalg.norm(cross))
+    cosine = float(np.clip(np.dot(source_unit, target_unit), -1.0, 1.0))
+    if sine < 1e-8:
+        if cosine > 0.0:
+            return np.eye(3, dtype=np.float64)
+        helper = np.array([1.0, 0.0, 0.0])
+        if abs(float(np.dot(helper, source_unit))) > 0.8:
+            helper = np.array([0.0, 1.0, 0.0])
+        axis = _safe_unit(np.cross(source_unit, helper))
+        return Rotation.from_rotvec(np.pi * axis).as_matrix()
+    axis = cross / sine
+    angle = np.arctan2(sine, cosine)
+    return Rotation.from_rotvec(axis * angle).as_matrix()
+
+
+def _finger_curls(joints: np.ndarray) -> dict[str, float]:
+    curls: dict[str, float] = {}
+    for name, chain in _FINGER_CHAINS.items():
+        segments = np.diff(joints[chain], axis=0)
+        total = 0.0
+        for first, second in zip(segments[:-1], segments[1:]):
+            denominator = float(np.linalg.norm(first) * np.linalg.norm(second))
+            if denominator < 1e-10:
+                continue
+            cosine = float(np.clip(np.dot(first, second) / denominator, -1.0, 1.0))
+            total += float(np.arccos(cosine))
+        curls[name] = total
+    return curls
+
+
+class ManoHandSequence:
+    """Load camera-space MANO and align its scale with SAM3D/MoGe point maps.
+
+    HaWoR's monocular hand mesh and MoGe point maps have different metric
+    scales.  Their image projections are nevertheless shared.  For every
+    requested frame we project the MANO vertices into the hand mask and use
+    the median ``pointmap_z / mano_z`` ratio.  A short temporal median removes
+    transparent-object depth outliers.
+    """
+
+    def __init__(
+        self,
+        hand_meshes_path: str | Path,
+        hand: str = "left",
+        pointmap_dir: str | Path | None = None,
+        hand_masks_root: str | Path | None = None,
+        hand_mask_name: str | None = None,
+        hand_focal: float = 609.5352935791016,
+        coordinate_scale: float = 1.7,
+        scale_smoothing_radius: int = 2,
+        flip_xy_to_pytorch3d: bool = True,
+    ) -> None:
+        if hand not in {"left", "right"}:
+            raise ValueError(f"hand must be left or right, got {hand!r}")
+        data = np.load(hand_meshes_path, allow_pickle=False)
+        joints_key = f"{hand}_joints"
+        if joints_key not in data:
+            available = [key for key in ("left_joints", "right_joints") if key in data]
+            raise KeyError(f"{joints_key} is missing; available joint arrays: {available}")
+        self.hand = hand
+        self.raw_joints = np.asarray(data[joints_key], dtype=np.float64)
+        vertices_key = f"{hand}_vertices"
+        self.raw_vertices = (
+            np.asarray(data[vertices_key], dtype=np.float64)
+            if vertices_key in data
+            else None
+        )
+        if "frame_indices" in data:
+            frame_indices = np.asarray(data["frame_indices"], dtype=np.int64)
+        else:
+            frame_indices = np.arange(self.raw_joints.shape[0], dtype=np.int64)
+        if len(frame_indices) != self.raw_joints.shape[0]:
+            raise ValueError("frame_indices and MANO arrays have different lengths")
+        valid_key = f"{hand}_valid"
+        valid = np.asarray(
+            data[valid_key] if valid_key in data else np.ones(len(frame_indices)),
+            dtype=bool,
+        )
+        self.frame_to_row = {
+            int(frame): int(row)
+            for row, frame in enumerate(frame_indices)
+            if bool(valid[row])
+        }
+        self.pointmap_dir = Path(pointmap_dir) if pointmap_dir else None
+        self.hand_masks_root = Path(hand_masks_root) if hand_masks_root else None
+        self.hand_mask_name = hand_mask_name
+        self.hand_focal = float(hand_focal)
+        self.coordinate_scale = float(coordinate_scale)
+        self.scale_smoothing_radius = max(int(scale_smoothing_radius), 0)
+        self.flip_xy_to_pytorch3d = bool(flip_xy_to_pytorch3d)
+        self._raw_scale_cache: dict[int, float | None] = {}
+        self._smooth_scale_cache: dict[int, float] = {}
+
+    def has_frame(self, frame_idx: int) -> bool:
+        return int(frame_idx) in self.frame_to_row
+
+    def _row(self, frame_idx: int) -> int:
+        try:
+            return self.frame_to_row[int(frame_idx)]
+        except KeyError as exc:
+            raise IndexError(f"MANO is invalid or unavailable at frame {frame_idx}") from exc
+
+    def _hand_mask_path(self, frame_idx: int) -> Path | None:
+        if self.hand_masks_root is None or not self.hand_mask_name:
+            return None
+        return (
+            self.hand_masks_root
+            / f"frame_{frame_idx:06d}_masks"
+            / f"{self.hand_mask_name}.png"
+        )
+
+    def _estimate_raw_scale(self, frame_idx: int) -> float | None:
+        frame_idx = int(frame_idx)
+        if frame_idx in self._raw_scale_cache:
+            return self._raw_scale_cache[frame_idx]
+        result: float | None = None
+        mask_path = self._hand_mask_path(frame_idx)
+        if (
+            self.raw_vertices is not None
+            and self.pointmap_dir is not None
+            and mask_path is not None
+            and mask_path.is_file()
+            and self.has_frame(frame_idx)
+        ):
+            pointmap_path = self.pointmap_dir / f"{frame_idx:06d}_pointmap.npy"
+            if pointmap_path.is_file():
+                mask = _read_mask(mask_path)
+                vertices = self.raw_vertices[self._row(frame_idx)]
+                height, width = mask.shape
+                center = np.array([width / 2.0, height / 2.0], dtype=np.float64)
+                safe_z = np.maximum(vertices[:, 2:3], 1e-8)
+                pixels = np.rint(
+                    vertices[:, :2] / safe_z * self.hand_focal + center
+                ).astype(np.int64)
+                inside = (
+                    (pixels[:, 0] >= 0)
+                    & (pixels[:, 0] < width)
+                    & (pixels[:, 1] >= 0)
+                    & (pixels[:, 1] < height)
+                )
+                clipped_x = np.clip(pixels[:, 0], 0, width - 1)
+                clipped_y = np.clip(pixels[:, 1], 0, height - 1)
+                inside &= mask[clipped_y, clipped_x]
+                if int(inside.sum()) >= 24:
+                    pointmap = np.load(pointmap_path, mmap_mode="r")
+                    depth = np.asarray(
+                        pointmap[pixels[inside, 1], pixels[inside, 0], 2],
+                        dtype=np.float64,
+                    )
+                    ratios = depth / np.maximum(vertices[inside, 2], 1e-8)
+                    ratios = ratios[
+                        np.isfinite(ratios) & (ratios > 0.25) & (ratios < 5.0)
+                    ]
+                    if ratios.size >= 24:
+                        lower, upper = np.percentile(ratios, [15.0, 85.0])
+                        trimmed = ratios[(ratios >= lower) & (ratios <= upper)]
+                        if trimmed.size:
+                            result = float(np.median(trimmed))
+        self._raw_scale_cache[frame_idx] = result
+        return result
+
+    def scale_at(self, frame_idx: int) -> float:
+        frame_idx = int(frame_idx)
+        if frame_idx in self._smooth_scale_cache:
+            return self._smooth_scale_cache[frame_idx]
+        estimates = []
+        for neighbour in range(
+            frame_idx - self.scale_smoothing_radius,
+            frame_idx + self.scale_smoothing_radius + 1,
+        ):
+            if not self.has_frame(neighbour):
+                continue
+            estimate = self._estimate_raw_scale(neighbour)
+            if estimate is not None:
+                estimates.append(estimate)
+        scale = float(np.median(estimates)) if estimates else self.coordinate_scale
+        self._smooth_scale_cache[frame_idx] = scale
+        return scale
+
+    def _convert(self, points: np.ndarray, scale: float) -> np.ndarray:
+        converted = np.asarray(points, dtype=np.float64).copy() * float(scale)
+        if self.flip_xy_to_pytorch3d:
+            converted[..., :2] *= -1.0
+        return converted
+
+    def joints(self, frame_idx: int, common_scale: float | None = None) -> np.ndarray:
+        scale = self.scale_at(frame_idx) if common_scale is None else float(common_scale)
+        return self._convert(self.raw_joints[self._row(frame_idx)], scale)
+
+    def vertices(self, frame_idx: int, common_scale: float | None = None) -> np.ndarray:
+        if self.raw_vertices is None:
+            raise ValueError("MANO vertices are required for this operation")
+        scale = self.scale_at(frame_idx) if common_scale is None else float(common_scale)
+        return self._convert(self.raw_vertices[self._row(frame_idx)], scale)
+
+    def articulation_descriptor(self, frame_idx: int) -> np.ndarray:
+        joints = self.raw_joints[self._row(frame_idx)]
+        palm = _palm_transform(joints)
+        if palm is None:
+            raise ValueError(f"cannot construct palm frame at {frame_idx}")
+        scale = max(float(np.linalg.norm(joints[12] - joints[0])), 1e-6)
+        local = (joints - palm[:3, 3]) @ palm[:3, :3] / scale
+        curls = _finger_curls(joints)
+        thumb_distances = np.linalg.norm(joints[_TIP_INDICES[1:]] - joints[4], axis=1) / scale
+        descriptor = np.concatenate(
+            [
+                local.reshape(-1),
+                0.35 * np.array([curls[name] for name in _FINGER_NAMES]),
+                0.5 * thumb_distances,
+            ]
+        )
+        return descriptor.astype(np.float64)
+
+    def analyze_grasp(
+        self, frame_idx: int, override: str = "auto"
+    ) -> dict[str, Any]:
+        joints = self.raw_joints[self._row(frame_idx)]
+        curls = _finger_curls(joints)
+        palm_length = max(float(np.linalg.norm(joints[12] - joints[0])), 1e-6)
+        thumb_distances = np.linalg.norm(joints[_TIP_INDICES[1:]] - joints[4], axis=1)
+        thumb_ratios = thumb_distances / palm_length
+        nonthumb_curls = np.array(
+            [curls[name] for name in ("index", "middle", "ring", "pinky")]
+        )
+        curled_count = int((nonthumb_curls > 1.05).sum())
+        close_thumb_index = int(np.argmin(thumb_ratios))
+
+        nonthumb_tips = joints[_TIP_INDICES[1:]]
+        pairwise = np.linalg.norm(
+            nonthumb_tips[:, None, :] - nonthumb_tips[None, :, :], axis=2
+        )
+        pairwise += np.eye(4) * 1e6
+        closest_pair_flat = int(np.argmin(pairwise))
+        pair_first, pair_second = np.unravel_index(closest_pair_flat, pairwise.shape)
+
+        if override != "auto":
+            grasp_type = override
+        elif float(nonthumb_curls.mean()) >= 1.25 and curled_count >= 3:
+            grasp_type = "power_hold"
+        elif float(thumb_ratios.min()) < 0.48 and curled_count <= 2:
+            grasp_type = "pinch"
+        elif float(pairwise[pair_first, pair_second] / palm_length) < 0.35 and curled_count <= 2:
+            grasp_type = "clip"
+        elif curled_count >= 2:
+            grasp_type = "grab"
+        else:
+            grasp_type = "clip"
+
+        if grasp_type == "pinch":
+            active_fingers = ["thumb", _FINGER_NAMES[close_thumb_index + 1]]
+        elif grasp_type == "clip":
+            active_fingers = [
+                _FINGER_NAMES[pair_first + 1],
+                _FINGER_NAMES[pair_second + 1],
+            ]
+        elif grasp_type == "grab":
+            active_fingers = ["thumb"] + [
+                name
+                for name in ("index", "middle", "ring", "pinky")
+                if curls[name] > 0.75
+            ]
+        else:
+            active_fingers = list(_FINGER_NAMES)
+
+        return {
+            "type": grasp_type,
+            "curls": {name: float(value) for name, value in curls.items()},
+            "thumb_tip_ratios": thumb_ratios.tolist(),
+            "curled_nonthumb_count": curled_count,
+            "active_fingers": active_fingers,
+            "opposing_finger": _FINGER_NAMES[close_thumb_index + 1],
+            "clip_fingers": [
+                _FINGER_NAMES[pair_first + 1],
+                _FINGER_NAMES[pair_second + 1],
+            ],
+        }
+
+    def contact_joint_indices(self, analysis: dict[str, Any]) -> np.ndarray:
+        grasp_type = analysis["type"]
+        active = analysis["active_fingers"]
+        indices: list[int] = []
+        for name in active:
+            chain = _FINGER_CHAINS[name]
+            if grasp_type == "power_hold":
+                indices.extend(chain[1:].tolist())
+            elif grasp_type in {"pinch", "clip"}:
+                indices.extend(chain[-2:].tolist())
+            else:
+                indices.extend(chain[1:].tolist())
+        if len(set(indices)) < 3:
+            indices.extend([5, 9, 13])
+        return np.array(sorted(set(indices)), dtype=np.int64)
+
+    def rigid_motion(
+        self,
+        source_frame: int,
+        target_frame: int,
+        joint_indices: Iterable[int],
+    ) -> tuple[np.ndarray | None, dict[str, Any]]:
+        common_scale = float(
+            np.median([self.scale_at(source_frame), self.scale_at(target_frame)])
+        )
+        source = self.joints(source_frame, common_scale=common_scale)
+        target = self.joints(target_frame, common_scale=common_scale)
+        indices = np.asarray(list(joint_indices), dtype=np.int64)
+        transform = _rigid_fit(source[indices], target[indices])
+        diagnostics: dict[str, Any] = {
+            "source_frame": int(source_frame),
+            "target_frame": int(target_frame),
+            "joint_indices": indices.tolist(),
+            "mano_to_pointmap_scale": common_scale,
+        }
+        if transform is None:
+            diagnostics["failure"] = "rigid_fit_failed"
+            return None, diagnostics
+
+        prediction = source[indices] @ transform[:3, :3].T + transform[:3, 3]
+        residuals = np.linalg.norm(prediction - target[indices], axis=1)
+        median = float(np.median(residuals))
+        mad = float(np.median(np.abs(residuals - median)))
+        inliers = residuals <= median + max(2.5 * mad, 0.0025)
+        if int(inliers.sum()) >= 3 and int(inliers.sum()) < len(indices):
+            refined = _rigid_fit(source[indices[inliers]], target[indices[inliers]])
+            if refined is not None:
+                transform = refined
+                prediction = source[indices] @ transform[:3, :3].T + transform[:3, 3]
+                residuals = np.linalg.norm(prediction - target[indices], axis=1)
+        diagnostics["fit_median_mm"] = float(np.median(residuals) * 1000.0)
+        diagnostics["fit_max_mm"] = float(np.max(residuals) * 1000.0)
+        diagnostics["rotation_delta_deg"] = float(
+            np.rad2deg(_rotation_angle(transform[:3, :3]))
+        )
+        return transform, diagnostics
+
+
+# ---------------------------------------------------------------------------
+# Contact-joint motion propagation
+# ---------------------------------------------------------------------------
+
+
+class HandMotionPosePrior:
+    """Propagate a reliable object pose with active contact-joint motion."""
+
+    def __init__(
+        self,
+        hand_sequence: ManoHandSequence,
+        anchor_frame: int,
+        anchor_pose: dict[str, Any],
+        grasp_type: str = "auto",
+        coarse_blend_weight: float = 0.0,
+    ) -> None:
+        if not hand_sequence.has_frame(anchor_frame):
+            raise ValueError(f"hand is unavailable at anchor frame {anchor_frame}")
+        self.hand_sequence = hand_sequence
+        self.anchor_frame = int(anchor_frame)
+        self.anchor_pose = copy_pose(anchor_pose)
+        self.grasp_type = grasp_type
+        self.coarse_blend_weight = float(np.clip(coarse_blend_weight, 0.0, 1.0))
+
+    def estimate(
+        self,
+        frame_idx: int,
+        coarse_pose: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, torch.Tensor] | None, list[dict[str, torch.Tensor]], dict[str, Any]]:
+        diagnostics: dict[str, Any] = {
+            "mode": "hand_motion",
+            "anchor_frame": self.anchor_frame,
+        }
+        if not self.hand_sequence.has_frame(frame_idx):
+            diagnostics["failure"] = "invalid_hand_pose"
+            return None, [], diagnostics
+        analysis = self.hand_sequence.analyze_grasp(frame_idx, self.grasp_type)
+        indices = self.hand_sequence.contact_joint_indices(analysis)
+        motion, motion_diagnostics = self.hand_sequence.rigid_motion(
+            self.anchor_frame, frame_idx, indices
+        )
+        diagnostics.update(motion_diagnostics)
+        diagnostics["grasp"] = analysis
+        if motion is None:
+            return None, [], diagnostics
+        predicted_matrix = motion @ pose_to_matrix(self.anchor_pose)
+        scale = coarse_pose["scale"] if coarse_pose is not None else self.anchor_pose["scale"]
+        predicted = matrix_to_pose(predicted_matrix, scale)
+        if coarse_pose is not None and self.coarse_blend_weight > 0.0:
+            predicted = blend_poses(
+                predicted, coarse_pose, second_weight=self.coarse_blend_weight
+            )
+            diagnostics["coarse_blend_weight"] = self.coarse_blend_weight
+        diagnostics["predicted_translation"] = (
+            predicted["translation"].reshape(-1, 3)[0].tolist()
+        )
+        return predicted, [predicted], diagnostics
+
+
+# ---------------------------------------------------------------------------
+# Low-occlusion grasp-pose memory
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _GraspMemoryFrame:
+    frame_idx: int
+    pose: dict[str, torch.Tensor]
+    descriptor: np.ndarray
+    grasp_type: str
+    visible_area: int
+    proximity: float
+    quality: float = 0.0
+
+
+class GraspMemoryPosePrior:
+    """Retrieve similar historical grasps and propagate all top hypotheses."""
+
+    def __init__(
+        self,
+        hand_sequence: ManoHandSequence,
+        pose_archive_path: str | Path,
+        masks_root: str | Path,
+        object_name: str,
+        hand_masks_root: str | Path | None,
+        hand_mask_name: str | None,
+        history_start_frame: int = 0,
+        history_end_frame: int | None = None,
+        pool_size: int = 32,
+        top_k: int = 4,
+        lookback: int = 160,
+        grasp_type: str = "auto",
+        mask_dilation_px: int = 6,
+    ) -> None:
+        pose_frames, _ = load_pose_archive(pose_archive_path)
+        self.hand_sequence = hand_sequence
+        self.masks_root = Path(masks_root)
+        self.object_name = object_name
+        self.hand_masks_root = Path(hand_masks_root) if hand_masks_root else None
+        self.hand_mask_name = hand_mask_name
+        self.top_k = max(int(top_k), 1)
+        self.lookback = max(int(lookback), 1)
+        self.grasp_type = grasp_type
+        self.mask_dilation_px = max(int(mask_dilation_px), 0)
+        end = history_end_frame if history_end_frame is not None else 10**9
+
+        candidates: list[_GraspMemoryFrame] = []
+        for frame_idx in sorted(pose_frames):
+            if not (history_start_frame <= frame_idx < end):
+                continue
+            if not hand_sequence.has_frame(frame_idx):
+                continue
+            object_path = (
+                self.masks_root
+                / f"frame_{frame_idx:06d}_masks"
+                / f"{self.object_name}.png"
+            )
+            if not object_path.is_file():
+                continue
+            object_mask = _read_mask(object_path)
+            visible_area = int(object_mask.sum())
+            if visible_area == 0:
+                continue
+            proximity = 0.0
+            if self.hand_masks_root is not None and self.hand_mask_name:
+                hand_path = (
+                    self.hand_masks_root
+                    / f"frame_{frame_idx:06d}_masks"
+                    / f"{self.hand_mask_name}.png"
+                )
+                if hand_path.is_file():
+                    hand_mask = _read_mask(hand_path, object_mask.shape)
+                    proximity = float(
+                        (object_mask & _dilate(hand_mask, self.mask_dilation_px)).sum()
+                    ) / max(visible_area, 1)
+            try:
+                descriptor = hand_sequence.articulation_descriptor(frame_idx)
+                analysis = hand_sequence.analyze_grasp(frame_idx, grasp_type)
+            except (IndexError, ValueError):
+                continue
+            candidates.append(
+                _GraspMemoryFrame(
+                    frame_idx=frame_idx,
+                    pose=result_to_pose(pose_frames[frame_idx]),
+                    descriptor=descriptor,
+                    grasp_type=analysis["type"],
+                    visible_area=visible_area,
+                    proximity=proximity,
+                )
+            )
+        if not candidates:
+            raise ValueError("no usable hand-pose memory frames")
+
+        areas = np.array([item.visible_area for item in candidates], dtype=np.float64)
+        low, high = np.percentile(areas, [10.0, 90.0])
+        denominator = max(float(high - low), 1.0)
+        for item in candidates:
+            area_score = float(np.clip((item.visible_area - low) / denominator, 0.0, 1.0))
+            item.quality = 0.75 * area_score + 0.25 * (1.0 - item.proximity)
+
+        chronological = sorted(candidates, key=lambda item: item.frame_idx)
+        selected: list[_GraspMemoryFrame] = []
+        for indices in np.array_split(
+            np.arange(len(chronological)), min(max(int(pool_size), 1), len(chronological))
+        ):
+            if len(indices) == 0:
+                continue
+            selected.append(
+                max((chronological[int(index)] for index in indices), key=lambda x: x.quality)
+            )
+        self.pool = sorted(selected, key=lambda item: item.frame_idx)
+
+    @staticmethod
+    def _medoid(priors: list[dict[str, torch.Tensor]]) -> int:
+        if len(priors) <= 1:
+            return 0
+        matrices = [pose_to_matrix(pose) for pose in priors]
+        costs = np.zeros(len(priors), dtype=np.float64)
+        for first in range(len(priors)):
+            for second in range(first + 1, len(priors)):
+                translation = np.linalg.norm(
+                    matrices[first][:3, 3] - matrices[second][:3, 3]
+                ) / 0.05
+                rotation = _rotation_angle(
+                    matrices[first][:3, :3].T @ matrices[second][:3, :3]
+                ) / np.deg2rad(30.0)
+                distance = float(translation + rotation)
+                costs[first] += distance
+                costs[second] += distance
+        return int(np.argmin(costs))
+
+    def estimate(
+        self,
+        frame_idx: int,
+        coarse_pose: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, torch.Tensor] | None, list[dict[str, torch.Tensor]], dict[str, Any]]:
+        diagnostics: dict[str, Any] = {
+            "mode": "hand_memory",
+            "pool_frames": [item.frame_idx for item in self.pool],
+        }
+        if not self.hand_sequence.has_frame(frame_idx):
+            diagnostics["failure"] = "invalid_hand_pose"
+            return None, [], diagnostics
+        descriptor = self.hand_sequence.articulation_descriptor(frame_idx)
+        analysis = self.hand_sequence.analyze_grasp(frame_idx, self.grasp_type)
+        eligible = [
+            item
+            for item in self.pool
+            if item.frame_idx < frame_idx and item.frame_idx >= frame_idx - self.lookback
+        ]
+        if not eligible:
+            diagnostics["failure"] = "no_eligible_memory"
+            return None, [], diagnostics
+
+        def retrieval_cost(item: _GraspMemoryFrame) -> float:
+            descriptor_distance = float(
+                np.sqrt(np.mean(np.square(item.descriptor - descriptor)))
+            )
+            class_penalty = 0.0 if item.grasp_type == analysis["type"] else 0.20
+            age_penalty = 0.08 * (frame_idx - item.frame_idx) / self.lookback
+            quality_penalty = 0.12 * (1.0 - item.quality)
+            return descriptor_distance + class_penalty + age_penalty + quality_penalty
+
+        retrieved = sorted(eligible, key=retrieval_cost)[: self.top_k]
+        indices = self.hand_sequence.contact_joint_indices(analysis)
+        priors: list[dict[str, torch.Tensor]] = []
+        used_frames: list[int] = []
+        fit_diagnostics: dict[int, dict[str, Any]] = {}
+        for memory in retrieved:
+            motion, fit = self.hand_sequence.rigid_motion(
+                memory.frame_idx, frame_idx, indices
+            )
+            fit_diagnostics[memory.frame_idx] = fit
+            if motion is None:
+                continue
+            matrix = motion @ pose_to_matrix(memory.pose)
+            scale = coarse_pose["scale"] if coarse_pose is not None else memory.pose["scale"]
+            priors.append(matrix_to_pose(matrix, scale))
+            used_frames.append(memory.frame_idx)
+        diagnostics.update(
+            {
+                "grasp": analysis,
+                "retrieved_frames": [item.frame_idx for item in retrieved],
+                "retrieval_costs": {
+                    item.frame_idx: retrieval_cost(item) for item in retrieved
+                },
+                "used_frames": used_frames,
+                "motion_fits": fit_diagnostics,
+            }
+        )
+        if not priors:
+            diagnostics["failure"] = "all_memory_motion_fits_failed"
+            return None, [], diagnostics
+        medoid_index = self._medoid(priors)
+        diagnostics["medoid_frame"] = used_frames[medoid_index]
+        return priors[medoid_index], priors, diagnostics
+
+    def pool_summary(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "frame_idx": item.frame_idx,
+                "quality": item.quality,
+                "visible_area": item.visible_area,
+                "hand_proximity": item.proximity,
+                "grasp_type": item.grasp_type,
+            }
+            for item in self.pool
+        ]
+
+
+# ---------------------------------------------------------------------------
+# User-proposed grasp-category geometric references
+# ---------------------------------------------------------------------------
+
+
+class GraspTypePosePrior:
+    """Category-specific object reference for grab/clip/pinch/power hold."""
+
+    def __init__(
+        self,
+        hand_sequence: ManoHandSequence,
+        anchor_frame: int,
+        anchor_pose: dict[str, Any],
+        canonical_axis: np.ndarray,
+        grasp_type: str = "auto",
+    ) -> None:
+        self.hand_sequence = hand_sequence
+        self.anchor_frame = int(anchor_frame)
+        self.anchor_pose = copy_pose(anchor_pose)
+        axis = _safe_unit(canonical_axis)
+        if axis is None:
+            raise ValueError("canonical object axis is degenerate")
+        self.canonical_axis = axis
+        self.grasp_type = grasp_type
+
+    def _grasp_frame(
+        self,
+        frame_idx: int,
+        analysis: dict[str, Any],
+        common_scale: float,
+    ) -> np.ndarray | None:
+        joints = self.hand_sequence.joints(frame_idx, common_scale=common_scale)
+        across = joints[5] - joints[17]
+        forward = joints[9] - joints[0]
+        palm_normal = np.cross(across, forward)
+        grasp_type = analysis["type"]
+        if grasp_type == "pinch":
+            opposing = analysis["opposing_finger"]
+            opposing_tip = int(_FINGER_CHAINS[opposing][-1])
+            origin = 0.5 * (joints[4] + joints[opposing_tip])
+            return _make_frame(origin, joints[opposing_tip] - joints[4], forward)
+        if grasp_type == "clip":
+            first, second = analysis["clip_fingers"]
+            first_tip = int(_FINGER_CHAINS[first][-1])
+            second_tip = int(_FINGER_CHAINS[second][-1])
+            origin = 0.5 * (joints[first_tip] + joints[second_tip])
+            return _make_frame(origin, joints[second_tip] - joints[first_tip], forward)
+        if grasp_type == "grab":
+            active_tips = [int(_FINGER_CHAINS[name][-1]) for name in analysis["active_fingers"]]
+            origin = joints[active_tips].mean(axis=0)
+            return _make_frame(origin, palm_normal, across)
+        # For a power hold the cup/bottle axis normally follows the hand's
+        # wrist-to-finger tube.  Only constrain this axis; axial twist remains
+        # deliberately ambiguous for a rotationally symmetric beaker.
+        distal = np.array([3, 4, 7, 8, 11, 12, 15, 16, 19, 20], dtype=np.int64)
+        origin = joints[distal].mean(axis=0)
+        return _make_frame(origin, forward, across)
+
+    def estimate(
+        self,
+        frame_idx: int,
+        coarse_pose: dict[str, Any] | None = None,
+    ) -> tuple[
+        dict[str, torch.Tensor] | None,
+        list[dict[str, torch.Tensor]],
+        dict[str, Any] | None,
+        dict[str, Any],
+    ]:
+        diagnostics: dict[str, Any] = {
+            "mode": "grasp_type",
+            "anchor_frame": self.anchor_frame,
+        }
+        if not self.hand_sequence.has_frame(frame_idx):
+            diagnostics["failure"] = "invalid_hand_pose"
+            return None, [], None, diagnostics
+        target_analysis = self.hand_sequence.analyze_grasp(frame_idx, self.grasp_type)
+        anchor_analysis = self.hand_sequence.analyze_grasp(
+            self.anchor_frame,
+            target_analysis["type"] if self.grasp_type == "auto" else self.grasp_type,
+        )
+        common_scale = float(
+            np.median(
+                [
+                    self.hand_sequence.scale_at(self.anchor_frame),
+                    self.hand_sequence.scale_at(frame_idx),
+                ]
+            )
+        )
+        anchor_frame = self._grasp_frame(
+            self.anchor_frame, anchor_analysis, common_scale
+        )
+        target_frame = self._grasp_frame(frame_idx, target_analysis, common_scale)
+        diagnostics["grasp"] = target_analysis
+        diagnostics["mano_to_pointmap_scale"] = common_scale
+        if anchor_frame is None or target_frame is None:
+            diagnostics["failure"] = "grasp_frame_failed"
+            return None, [], None, diagnostics
+
+        if target_analysis["type"] == "power_hold":
+            rotation_delta = _align_vectors(
+                anchor_frame[:3, 0], target_frame[:3, 0]
+            )
+            translation_delta = (
+                target_frame[:3, 3] - rotation_delta @ anchor_frame[:3, 3]
+            )
+            motion = np.eye(4, dtype=np.float64)
+            motion[:3, :3] = rotation_delta
+            motion[:3, 3] = translation_delta
+            diagnostics["constraint"] = "power_hold_tube_axis"
+        else:
+            motion = target_frame @ np.linalg.inv(anchor_frame)
+            diagnostics["constraint"] = f"{target_analysis['type']}_interaction_frame"
+
+        predicted_matrix = motion @ pose_to_matrix(self.anchor_pose)
+        scale = coarse_pose["scale"] if coarse_pose is not None else self.anchor_pose["scale"]
+        predicted = matrix_to_pose(predicted_matrix, scale)
+
+        # Preserve the cylinder's axial symmetry as four explicit hypotheses.
+        priors = []
+        for angle in (0.0, 0.5 * np.pi, np.pi, 1.5 * np.pi):
+            symmetry = Rotation.from_rotvec(self.canonical_axis * angle).as_matrix()
+            hypothesis = predicted_matrix.copy()
+            hypothesis[:3, :3] = predicted_matrix[:3, :3] @ symmetry
+            priors.append(matrix_to_pose(hypothesis, scale))
+        target_axis = predicted_matrix[:3, :3] @ self.canonical_axis
+        axis_context = {
+            "canonical_axis": self.canonical_axis.copy(),
+            "target_axis": target_axis,
+            "grasp_type": target_analysis["type"],
+        }
+        diagnostics["target_axis"] = target_axis.tolist()
+        return predicted, priors, axis_context, diagnostics
+
+
+def grasp_axis_score(
+    pose: dict[str, Any],
+    context: dict[str, Any],
+    sigma_deg: float = 20.0,
+) -> tuple[float, float]:
+    transform = pose_to_matrix(pose)
+    canonical = np.asarray(context["canonical_axis"], dtype=np.float64)
+    target = _safe_unit(np.asarray(context["target_axis"], dtype=np.float64))
+    predicted = _safe_unit(transform[:3, :3] @ canonical)
+    if target is None or predicted is None:
+        return 0.0, 180.0
+    # A transparent beaker is nearly symmetric under axis reversal in
+    # silhouette; do not falsely penalize the sign here.
+    cosine = float(np.clip(abs(np.dot(target, predicted)), 0.0, 1.0))
+    angle = float(np.arccos(cosine))
+    sigma = max(float(np.deg2rad(sigma_deg)), 1e-8)
+    return float(np.exp(-angle / sigma)), float(np.rad2deg(angle))
+
+
+# ---------------------------------------------------------------------------
+# COP-style contact-distance consistency
+# ---------------------------------------------------------------------------
+
+
+class ContactConsistencyPrior:
+    """Build short-window fingertip-to-object distance signatures."""
+
+    def __init__(
+        self,
+        hand_sequence: ManoHandSequence,
+        mesh_vertices: np.ndarray,
+        pose_archive_path: str | Path,
+        reference_frames: Iterable[int],
+        sample_vertices: int = 768,
+        grasp_type: str = "auto",
+    ) -> None:
+        pose_frames, _ = load_pose_archive(pose_archive_path)
+        vertices = np.asarray(mesh_vertices, dtype=np.float64)
+        if vertices.ndim != 2 or vertices.shape[1] != 3:
+            raise ValueError("mesh_vertices must have shape (N, 3)")
+        count = min(max(int(sample_vertices), 64), len(vertices))
+        indices = np.linspace(0, len(vertices) - 1, count, dtype=np.int64)
+        self.canonical_vertices = vertices[indices]
+        self.hand_sequence = hand_sequence
+        self.grasp_type = grasp_type
+        self.reference_poses = {
+            int(frame): result_to_pose(pose_frames[int(frame)])
+            for frame in reference_frames
+            if int(frame) in pose_frames and hand_sequence.has_frame(int(frame))
+        }
+        if not self.reference_poses:
+            raise ValueError("no valid contact reference frames")
+
+    def context(self, frame_idx: int) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        diagnostics: dict[str, Any] = {
+            "contact_reference_frames": sorted(self.reference_poses),
+        }
+        if not self.hand_sequence.has_frame(frame_idx):
+            diagnostics["contact_failure"] = "invalid_hand_pose"
+            return None, diagnostics
+        analysis = self.hand_sequence.analyze_grasp(frame_idx, self.grasp_type)
+        joint_indices = self.hand_sequence.contact_joint_indices(analysis)
+        current_points = self.hand_sequence.joints(frame_idx)[joint_indices]
+        references = []
+        for reference_frame, pose in self.reference_poses.items():
+            reference_points = self.hand_sequence.joints(reference_frame)[joint_indices]
+            matrix = pose_to_matrix(pose)
+            scale = float(_as_numpy(pose["scale"]).reshape(-1)[0])
+            object_points = (
+                self.canonical_vertices * scale
+            ) @ matrix[:3, :3].T + matrix[:3, 3]
+            distances = np.linalg.norm(
+                reference_points[:, None, :] - object_points[None, :, :], axis=2
+            )
+            references.append(
+                {
+                    "frame_idx": reference_frame,
+                    "distances": distances.astype(np.float32),
+                    "surface_distances": distances.min(axis=1).astype(np.float32),
+                }
+            )
+        context = {
+            "canonical_vertices": self.canonical_vertices,
+            "current_hand_points": current_points,
+            "joint_indices": joint_indices,
+            "references": references,
+        }
+        diagnostics["contact_joint_indices"] = joint_indices.tolist()
+        diagnostics["contact_grasp_type"] = analysis["type"]
+        return context, diagnostics
+
+
+def contact_consistency_score(
+    pose: dict[str, Any],
+    context: dict[str, Any],
+    sigma: float = 0.025,
+) -> tuple[float, float, int]:
+    canonical = np.asarray(context["canonical_vertices"], dtype=np.float64)
+    hand_points = np.asarray(context["current_hand_points"], dtype=np.float64)
+    matrix = pose_to_matrix(pose)
+    scale = float(_as_numpy(pose["scale"]).reshape(-1)[0])
+    object_points = canonical * scale @ matrix[:3, :3].T + matrix[:3, 3]
+    distances = np.linalg.norm(
+        hand_points[:, None, :] - object_points[None, :, :], axis=2
+    )
+    best_residual = float("inf")
+    best_frame = -1
+    for reference in context["references"]:
+        reference_distances = np.asarray(reference["distances"], dtype=np.float64)
+        vector_residual = float(np.median(np.abs(distances - reference_distances)))
+        surface_residual = float(
+            np.median(
+                np.abs(
+                    distances.min(axis=1)
+                    - np.asarray(reference["surface_distances"], dtype=np.float64)
+                )
+            )
+        )
+        residual = 0.75 * vector_residual + 0.25 * surface_residual
+        if residual < best_residual:
+            best_residual = residual
+            best_frame = int(reference["frame_idx"])
+    score = float(np.exp(-best_residual / max(float(sigma), 1e-8)))
+    return score, best_residual, best_frame

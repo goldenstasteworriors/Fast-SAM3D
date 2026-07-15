@@ -112,14 +112,30 @@ from sam3d_objects.data.dataset.tdfy.pose_target import PoseTargetConverter
 from fft.fft2d import calculate_hfer_robust
 from pose_log_likelihood import compute_pose_only_log_likelihoods
 from pose_priors import (
+    ContactConsistencyPrior,
+    GraspMemoryPosePrior,
+    GraspTypePosePrior,
     HandObjectPosePrior,
+    HandMotionPosePrior,
     HistoryMemoryPosePrior,
+    ManoHandSequence,
+    contact_consistency_score,
     copy_pose,
+    grasp_axis_score,
     history_alignment_score,
     load_pose_archive,
     pose_errors,
     result_to_pose,
 )
+
+
+_NEW_HAND_PRIOR_MODES = {
+    "hand_motion",
+    "hand_memory",
+    "grasp_type",
+    "hand_contact",
+    "hand_fusion",
+}
 
 
 # ------------------------------------------------------------------
@@ -1212,11 +1228,18 @@ def guided_predict_pose(
     ll_steps=25,
     num_pose_samples_per_pgs=None,
     candidate_pose_prior=None,
+    candidate_pose_priors=None,
     prior_translation_score_weight=0.0,
     prior_rotation_score_weight=0.0,
     history_context=None,
     history_alignment_score_weight=0.0,
     history_alignment_sigma=0.035,
+    contact_context=None,
+    contact_consistency_score_weight=0.0,
+    contact_consistency_sigma=0.025,
+    grasp_axis_context=None,
+    grasp_axis_score_weight=0.0,
+    grasp_axis_sigma_deg=20.0,
 ):
     # Preprocess (once -- independent of seed)
     pointmap_dict = pipeline.compute_pointmap(rgba)
@@ -1365,14 +1388,39 @@ def guided_predict_pose(
         score = float(base_score)
         result["base_selection_score"] = float(base_score)
 
-        if candidate_pose_prior is not None:
-            translation_error, rotation_error = pose_errors(
-                pose, candidate_pose_prior,
-            )
+        active_priors = candidate_pose_priors
+        if active_priors is None and candidate_pose_prior is not None:
+            active_priors = [candidate_pose_prior]
+        if active_priors:
+            prior_errors = [pose_errors(pose, prior) for prior in active_priors]
+            weighted_errors = [
+                float(prior_translation_score_weight) * translation_error
+                + float(prior_rotation_score_weight) * rotation_error
+                for translation_error, rotation_error in prior_errors
+            ]
+            if max(
+                float(prior_translation_score_weight),
+                float(prior_rotation_score_weight),
+            ) > 0.0:
+                best_prior_index = int(np.argmin(weighted_errors))
+            else:
+                # Diagnostics-only fallback with commensurate 5 cm / 30 degree
+                # scales.  It does not alter selection when both weights are 0.
+                best_prior_index = int(
+                    np.argmin(
+                        [
+                            translation_error / 0.05
+                            + rotation_error / np.deg2rad(30.0)
+                            for translation_error, rotation_error in prior_errors
+                        ]
+                    )
+                )
+            translation_error, rotation_error = prior_errors[best_prior_index]
+            result["pose_prior_hypothesis_count"] = len(active_priors)
+            result["pose_prior_best_hypothesis"] = best_prior_index
             result["pose_prior_translation_error"] = translation_error
             result["pose_prior_rotation_error_deg"] = float(np.rad2deg(rotation_error))
-            score -= float(prior_translation_score_weight) * translation_error
-            score -= float(prior_rotation_score_weight) * rotation_error
+            score -= weighted_errors[best_prior_index]
 
         if history_context is not None:
             alignment_score, median_residual = history_alignment_score(
@@ -1382,6 +1430,29 @@ def guided_predict_pose(
             result["history_alignment_score"] = alignment_score
             result["history_alignment_median_m"] = median_residual
             score += float(history_alignment_score_weight) * alignment_score
+
+        if contact_context is not None:
+            contact_score, contact_residual, contact_reference = (
+                contact_consistency_score(
+                    pose,
+                    contact_context,
+                    sigma=contact_consistency_sigma,
+                )
+            )
+            result["contact_consistency_score"] = contact_score
+            result["contact_consistency_residual_m"] = contact_residual
+            result["contact_consistency_reference_frame"] = contact_reference
+            score += float(contact_consistency_score_weight) * contact_score
+
+        if grasp_axis_context is not None:
+            axis_score, axis_error_deg = grasp_axis_score(
+                pose,
+                grasp_axis_context,
+                sigma_deg=grasp_axis_sigma_deg,
+            )
+            result["grasp_axis_score"] = axis_score
+            result["grasp_axis_error_deg"] = axis_error_deg
+            score += float(grasp_axis_score_weight) * axis_score
 
         result["selection_score"] = score
         all_samples.append(result)
@@ -1739,8 +1810,11 @@ def process_video(args):
             f"{args.pose_archive}"
         )
 
-    if args.pose_prior_mode == "hand" and not args.hand_meshes:
-        logger.error("--pose_prior_mode hand requires --hand_meshes")
+    if (
+        args.pose_prior_mode == "hand"
+        or args.pose_prior_mode in _NEW_HAND_PRIOR_MODES
+    ) and not args.hand_meshes:
+        logger.error(f"--pose_prior_mode {args.pose_prior_mode} requires --hand_meshes")
         return
     if args.pose_prior_mode == "history":
         if not args.pose_archive:
@@ -1748,6 +1822,10 @@ def process_video(args):
             return
         if not args.history_pointmap_dir:
             logger.error("--pose_prior_mode history requires --history_pointmap_dir")
+            return
+    if args.pose_prior_mode in {"hand_memory", "hand_contact", "hand_fusion"}:
+        if not args.pose_archive:
+            logger.error(f"--pose_prior_mode {args.pose_prior_mode} requires --pose_archive")
             return
 
     # ---- Load pipeline (Fast-SAM3D style) ----
@@ -1866,7 +1944,12 @@ def process_video(args):
 
     init_trimesh = (
         trimesh.load(mesh_path, force="mesh")
-        if (args.post_optimize or args.save_layout or args.scoring_metric == "render_iou")
+        if (
+            args.post_optimize
+            or args.save_layout
+            or args.scoring_metric == "render_iou"
+            or args.pose_prior_mode in {"grasp_type", "hand_contact", "hand_fusion"}
+        )
         else None
     )
 
@@ -1932,11 +2015,19 @@ def process_video(args):
             args.pose_guidance_strength = 0.5
 
     pose_prior_provider = None
+    hand_sequence = None
+    hand_motion_provider = None
+    hand_memory_provider = None
+    grasp_type_provider = None
+    contact_provider = None
     history_pool_summary = None
-    if args.pose_prior_mode == "hand":
-        hand_anchor_frame = (
-            init_frame if args.hand_anchor_frame is None else args.hand_anchor_frame
-        )
+    hand_memory_pool_summary = None
+
+    hand_anchor_frame = (
+        init_frame if args.hand_anchor_frame is None else args.hand_anchor_frame
+    )
+    hand_anchor_pose = None
+    if args.pose_prior_mode == "hand" or args.pose_prior_mode in _NEW_HAND_PRIOR_MODES:
         if hand_anchor_frame in pose_archive_frames:
             hand_anchor_pose = result_to_pose(pose_archive_frames[hand_anchor_frame])
         elif hand_anchor_frame == init_frame:
@@ -1947,6 +2038,8 @@ def process_video(args):
                 "through --pose_archive or use --init_frame"
             )
             return
+
+    if args.pose_prior_mode == "hand":
         try:
             pose_prior_provider = HandObjectPosePrior(
                 args.hand_meshes,
@@ -2004,6 +2097,102 @@ def process_video(args):
                 for item in history_pool_summary
             )
         )
+    elif args.pose_prior_mode in _NEW_HAND_PRIOR_MODES:
+        hand_mask_name = args.hand_mask_name
+        if hand_mask_name is None and occluder_mask_names:
+            hand_mask_name = occluder_mask_names[0]
+        hand_pointmap_dir = args.hand_pointmap_dir
+        if hand_pointmap_dir is None:
+            hand_pointmap_dir = args.history_pointmap_dir
+        if hand_pointmap_dir is None:
+            hand_pointmap_dir = os.path.join(args.vid_dir, "all_frames")
+        try:
+            hand_sequence = ManoHandSequence(
+                args.hand_meshes,
+                hand=args.hand_side,
+                pointmap_dir=hand_pointmap_dir,
+                hand_masks_root=args.occluder_masks_root,
+                hand_mask_name=hand_mask_name,
+                hand_focal=args.hand_camera_focal,
+                coordinate_scale=args.hand_coordinate_scale,
+                scale_smoothing_radius=args.hand_scale_smoothing_radius,
+                flip_xy_to_pytorch3d=args.hand_flip_xy_to_pytorch3d,
+            )
+            if args.pose_prior_mode in {"hand_motion", "hand_contact", "hand_fusion"}:
+                hand_motion_provider = HandMotionPosePrior(
+                    hand_sequence,
+                    anchor_frame=hand_anchor_frame,
+                    anchor_pose=hand_anchor_pose,
+                    grasp_type=args.hand_grasp_type,
+                    coarse_blend_weight=args.hand_coarse_blend_weight,
+                )
+            if args.pose_prior_mode in {"hand_memory", "hand_fusion"}:
+                hand_memory_provider = GraspMemoryPosePrior(
+                    hand_sequence,
+                    pose_archive_path=args.pose_archive,
+                    masks_root=masks_root,
+                    object_name=args.object_name,
+                    hand_masks_root=args.occluder_masks_root,
+                    hand_mask_name=hand_mask_name,
+                    history_start_frame=args.hand_memory_start_frame,
+                    history_end_frame=args.hand_memory_end_frame,
+                    pool_size=args.hand_memory_pool_size,
+                    top_k=args.hand_memory_top_k,
+                    lookback=args.hand_memory_lookback,
+                    grasp_type=args.hand_grasp_type,
+                    mask_dilation_px=args.occluder_dilation_px,
+                )
+                hand_memory_pool_summary = hand_memory_provider.pool_summary()
+            if args.pose_prior_mode in {"grasp_type", "hand_fusion"}:
+                mesh_vertices = np.asarray(init_trimesh.vertices, dtype=np.float64)
+                centered_vertices = mesh_vertices - mesh_vertices.mean(axis=0)
+                _, _, principal_axes = np.linalg.svd(centered_vertices, full_matrices=False)
+                canonical_axis = principal_axes[0]
+                grasp_type_provider = GraspTypePosePrior(
+                    hand_sequence,
+                    anchor_frame=hand_anchor_frame,
+                    anchor_pose=hand_anchor_pose,
+                    canonical_axis=canonical_axis,
+                    grasp_type=args.hand_grasp_type,
+                )
+            if args.pose_prior_mode in {"hand_contact", "hand_fusion"}:
+                if args.contact_reference_frames:
+                    reference_frames = [
+                        int(value.strip())
+                        for value in args.contact_reference_frames.split(",")
+                        if value.strip()
+                    ]
+                else:
+                    reference_frames = sorted(
+                        frame
+                        for frame in pose_archive_frames
+                        if hand_anchor_frame - args.contact_reference_window < frame
+                        <= hand_anchor_frame
+                    )
+                contact_provider = ContactConsistencyPrior(
+                    hand_sequence,
+                    mesh_vertices=np.asarray(init_trimesh.vertices, dtype=np.float64),
+                    pose_archive_path=args.pose_archive,
+                    reference_frames=reference_frames,
+                    sample_vertices=args.contact_sample_vertices,
+                    grasp_type=args.hand_grasp_type,
+                )
+        except (OSError, KeyError, ValueError, IndexError) as exc:
+            logger.error(f"Failed to initialize {args.pose_prior_mode}: {exc}")
+            return
+        logger.info(
+            f"Hand-aware pose prior: mode={args.pose_prior_mode}, "
+            f"hand={args.hand_side}, anchor={hand_anchor_frame}, "
+            f"scale@anchor={hand_sequence.scale_at(hand_anchor_frame):.4f}"
+        )
+        if hand_memory_pool_summary is not None:
+            logger.info(
+                "Grasp memory pool: "
+                + ", ".join(
+                    f"f{item['frame_idx']}({item['grasp_type']},q={item['quality']:.2f})"
+                    for item in hand_memory_pool_summary
+                )
+            )
 
     render_mesh = None
     image_hw = None
@@ -2081,7 +2270,10 @@ def process_video(args):
 
         frame_pose_target = pose_target
         candidate_pose_prior = None
+        candidate_pose_priors = None
         history_context = None
+        contact_context = None
+        grasp_axis_context = None
         pose_prior_diagnostics = {"mode": "none"}
         decoded_coarse_pose = (
             pose_target
@@ -2113,6 +2305,64 @@ def process_video(args):
             if prior_pose is not None:
                 frame_pose_target = prior_pose
                 candidate_pose_prior = prior_pose
+                candidate_pose_priors = [prior_pose]
+        elif args.pose_prior_mode == "hand_motion":
+            prior_pose, priors, pose_prior_diagnostics = (
+                hand_motion_provider.estimate(frame_idx, decoded_coarse_pose)
+            )
+            if prior_pose is not None:
+                frame_pose_target = prior_pose
+                candidate_pose_prior = prior_pose
+                candidate_pose_priors = priors
+        elif args.pose_prior_mode == "hand_memory":
+            prior_pose, priors, pose_prior_diagnostics = (
+                hand_memory_provider.estimate(frame_idx, decoded_coarse_pose)
+            )
+            if prior_pose is not None:
+                frame_pose_target = prior_pose
+                candidate_pose_prior = prior_pose
+                candidate_pose_priors = priors
+        elif args.pose_prior_mode == "grasp_type":
+            prior_pose, priors, grasp_axis_context, pose_prior_diagnostics = (
+                grasp_type_provider.estimate(frame_idx, decoded_coarse_pose)
+            )
+            if prior_pose is not None:
+                frame_pose_target = prior_pose
+                candidate_pose_prior = prior_pose
+                candidate_pose_priors = priors
+        elif args.pose_prior_mode == "hand_contact":
+            prior_pose, priors, pose_prior_diagnostics = (
+                hand_motion_provider.estimate(frame_idx, decoded_coarse_pose)
+            )
+            contact_context, contact_diagnostics = contact_provider.context(frame_idx)
+            pose_prior_diagnostics.update(contact_diagnostics)
+            if prior_pose is not None:
+                frame_pose_target = prior_pose
+                candidate_pose_prior = prior_pose
+                candidate_pose_priors = priors
+        elif args.pose_prior_mode == "hand_fusion":
+            prior_pose, priors, pose_prior_diagnostics = (
+                hand_memory_provider.estimate(frame_idx, decoded_coarse_pose)
+            )
+            if prior_pose is None:
+                prior_pose, priors, motion_diagnostics = (
+                    hand_motion_provider.estimate(frame_idx, decoded_coarse_pose)
+                )
+                pose_prior_diagnostics["motion_fallback"] = motion_diagnostics
+            type_pose, type_priors, grasp_axis_context, type_diagnostics = (
+                grasp_type_provider.estimate(frame_idx, decoded_coarse_pose)
+            )
+            pose_prior_diagnostics["grasp_type_prior"] = type_diagnostics
+            contact_context, contact_diagnostics = contact_provider.context(frame_idx)
+            pose_prior_diagnostics.update(contact_diagnostics)
+            if type_pose is not None:
+                priors = list(priors) + list(type_priors)
+            if prior_pose is None and type_pose is not None:
+                prior_pose = type_pose
+            if prior_pose is not None:
+                frame_pose_target = prior_pose
+                candidate_pose_prior = prior_pose
+                candidate_pose_priors = priors or [prior_pose]
 
         if args.pose_prior_mode != "none":
             logger.info(
@@ -2189,11 +2439,18 @@ def process_video(args):
             ll_steps=args.ll_steps,
             num_pose_samples_per_pgs=args.num_pose_samples_per_pgs,
             candidate_pose_prior=candidate_pose_prior,
+            candidate_pose_priors=candidate_pose_priors,
             prior_translation_score_weight=args.prior_translation_score_weight,
             prior_rotation_score_weight=args.prior_rotation_score_weight,
             history_context=history_context,
             history_alignment_score_weight=args.history_alignment_score_weight,
             history_alignment_sigma=args.history_alignment_sigma,
+            contact_context=contact_context,
+            contact_consistency_score_weight=args.contact_consistency_score_weight,
+            contact_consistency_sigma=args.contact_consistency_sigma,
+            grasp_axis_context=grasp_axis_context,
+            grasp_axis_score_weight=args.grasp_axis_score_weight,
+            grasp_axis_sigma_deg=args.grasp_axis_sigma_deg,
         )
 
         torch.cuda.synchronize()
@@ -2242,6 +2499,13 @@ def process_video(args):
             msg += f", prior_R_err={result['pose_prior_rotation_error_deg']:.1f}deg"
         if "history_alignment_median_m" in result:
             msg += f", history_med={result['history_alignment_median_m']:.4f}m"
+        if "contact_consistency_residual_m" in result:
+            msg += (
+                f", contact={result['contact_consistency_residual_m']:.4f}m"
+                f"@f{result['contact_consistency_reference_frame']}"
+            )
+        if "grasp_axis_error_deg" in result:
+            msg += f", axis_err={result['grasp_axis_error_deg']:.1f}deg"
         logger.info(msg)
 
         all_results[frame_idx] = result
@@ -2339,13 +2603,25 @@ def process_video(args):
         "pose_prior_mode": args.pose_prior_mode,
         "pose_archive": args.pose_archive,
         "hand_meshes": args.hand_meshes,
-        "hand_side": args.hand_side if args.pose_prior_mode == "hand" else None,
-        "hand_anchor_frame": (
-            args.hand_anchor_frame if args.pose_prior_mode == "hand" else None
+        "hand_side": (
+            args.hand_side
+            if args.pose_prior_mode == "hand" or args.pose_prior_mode in _NEW_HAND_PRIOR_MODES
+            else None
         ),
+        "hand_anchor_frame": (
+            args.hand_anchor_frame
+            if args.pose_prior_mode == "hand" or args.pose_prior_mode in _NEW_HAND_PRIOR_MODES
+            else None
+        ),
+        "hand_grasp_type": (
+            args.hand_grasp_type if args.pose_prior_mode in _NEW_HAND_PRIOR_MODES else None
+        ),
+        "hand_memory_pool": hand_memory_pool_summary,
         "prior_translation_score_weight": args.prior_translation_score_weight,
         "prior_rotation_score_weight": args.prior_rotation_score_weight,
         "history_alignment_score_weight": args.history_alignment_score_weight,
+        "contact_consistency_score_weight": args.contact_consistency_score_weight,
+        "grasp_axis_score_weight": args.grasp_axis_score_weight,
         "history_memory_pool": history_pool_summary,
         "frames": all_results,
     }
@@ -2401,12 +2677,28 @@ def main():
     parser.add_argument("--pose_archive", default=None,
                         help="Existing guided_poses.pt used for a non-layout init frame and prior anchors/keyframes")
     parser.add_argument("--pose_prior_mode", default="none",
-                        choices=["none", "hand", "history"],
-                        help="Additional pose prior: hand-object propagation or low-occlusion history memory")
+                        choices=[
+                            "none", "hand", "history", "hand_motion",
+                            "hand_memory", "grasp_type", "hand_contact",
+                            "hand_fusion",
+                        ],
+                        help=(
+                            "Additional pose prior. New hand modes provide active-joint "
+                            "motion, grasp memory, category geometry, COP-style contact, "
+                            "or their fusion."
+                        ))
     parser.add_argument("--prior_translation_score_weight", type=float, default=0.0,
                         help="Candidate penalty per metre from the active pose prior")
     parser.add_argument("--prior_rotation_score_weight", type=float, default=0.0,
                         help="Candidate penalty per radian from the active pose prior")
+    parser.add_argument("--contact_consistency_score_weight", type=float, default=0.0,
+                        help="Positive candidate reward for COP-style contact consistency")
+    parser.add_argument("--contact_consistency_sigma", type=float, default=0.025,
+                        help="Metre scale converting contact residual to a score")
+    parser.add_argument("--grasp_axis_score_weight", type=float, default=0.0,
+                        help="Positive candidate reward for grasp-category axis agreement")
+    parser.add_argument("--grasp_axis_sigma_deg", type=float, default=20.0,
+                        help="Angular scale for grasp-axis candidate scoring")
 
     # --- Hand-object relative pose prior ---
     parser.add_argument("--hand_meshes", default=None,
@@ -2424,6 +2716,34 @@ def main():
                         help="Metres above which a HaWoR coordinate reset is stitched")
     parser.add_argument("--hand_jump_rotation_threshold_deg", type=float, default=60.0,
                         help="Degrees above which a HaWoR coordinate reset is stitched")
+
+    # --- Camera-space MANO contact and grasp priors ---
+    parser.add_argument("--hand_pointmap_dir", default=None,
+                        help="MoGe point maps used to align monocular MANO scale")
+    parser.add_argument("--hand_mask_name", default=None,
+                        help="Hand mask filename stem; defaults to the first occluder")
+    parser.add_argument("--hand_camera_focal", type=float, default=609.5352935791016,
+                        help="Focal length used for HaWoR camera-space projection")
+    parser.add_argument("--hand_coordinate_scale", type=float, default=1.7,
+                        help="Fallback MANO-to-pointmap scale when depth calibration fails")
+    parser.add_argument("--hand_scale_smoothing_radius", type=int, default=2,
+                        help="Temporal median radius for MANO depth-scale calibration")
+    parser.add_argument("--hand_grasp_type", default="auto",
+                        choices=["auto", "grab", "clip", "pinch", "power_hold"],
+                        help="Automatic or forced grasp-category geometric reference")
+    parser.add_argument("--hand_coarse_blend_weight", type=float, default=0.0,
+                        help="Blend hand-motion target toward the chained SAM3D pose")
+    parser.add_argument("--hand_memory_start_frame", type=int, default=0)
+    parser.add_argument("--hand_memory_end_frame", type=int, default=None)
+    parser.add_argument("--hand_memory_pool_size", type=int, default=32)
+    parser.add_argument("--hand_memory_top_k", type=int, default=4)
+    parser.add_argument("--hand_memory_lookback", type=int, default=160)
+    parser.add_argument("--contact_reference_frames", default=None,
+                        help="Comma-separated reliable frames for contact signatures")
+    parser.add_argument("--contact_reference_window", type=int, default=4,
+                        help="Number of archive frames ending at the hand anchor when no list is given")
+    parser.add_argument("--contact_sample_vertices", type=int, default=768,
+                        help="Canonical mesh vertices used by contact-distance scoring")
 
     # --- EgoAERO-inspired low-occlusion history memory ---
     parser.add_argument("--history_pointmap_dir", default=None,
