@@ -174,6 +174,47 @@ rm -rf checkpoints/${TAG}-download
 
 ## 🚀 Usage
 
+### Occlusion-robust video pose priors
+
+`track_object.py` supports two optional priors for frames where the object is
+strongly occluded. Both keep the original image-conditioned diffusion and
+render-IoU evidence; the prior is injected into diffusion and candidate
+ranking as a soft constraint.
+
+The hand mode anchors a reliable grasp frame and propagates the hand--object
+relative rotation with HaWoR. Translation guidance is disabled by default in
+this mode because monocular hand translation is substantially less stable:
+
+```bash
+python track_object.py ... \
+    --pose_prior_mode hand \
+    --pose_archive /path/to/baseline/guided_poses.pt \
+    --hand_meshes /path/to/all_hand_meshes.npz \
+    --hand_anchor_frame 160 \
+    --pose_guidance_strength 0.6 \
+    --pose_translation_guidance_strength 0 \
+    --prior_rotation_score_weight 0.15
+```
+
+The history mode is a lightweight EgoAERO-style memory pool. It scores
+historical observations by visible area, valid depth, and hand occlusion;
+matches the best low-occlusion keyframes to the current frame; lifts matches
+with point maps; and estimates the current SE(3) pose with robust 3D fitting.
+When transparent surfaces provide too few reliable matches, it falls back to
+the rotation of the best low-occlusion keyframe while retaining chained
+translation:
+
+```bash
+python track_object.py ... \
+    --pose_prior_mode history \
+    --pose_archive /path/to/baseline/guided_poses.pt \
+    --history_pointmap_dir /path/to/all_frames \
+    --history_start_frame 100 \
+    --history_pool_size 24 \
+    --history_max_keyframes 4 \
+    --history_alignment_score_weight 0.2
+```
+
 ### Quick Start/Object Generation
 
 ```bash

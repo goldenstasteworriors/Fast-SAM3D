@@ -111,6 +111,15 @@ from sam3d_objects.pipeline.inference_utils import layout_post_optimization
 from sam3d_objects.data.dataset.tdfy.pose_target import PoseTargetConverter
 from fft.fft2d import calculate_hfer_robust
 from pose_log_likelihood import compute_pose_only_log_likelihoods
+from pose_priors import (
+    HandObjectPosePrior,
+    HistoryMemoryPosePrior,
+    copy_pose,
+    history_alignment_score,
+    load_pose_archive,
+    pose_errors,
+    result_to_pose,
+)
 
 
 # ------------------------------------------------------------------
@@ -650,6 +659,21 @@ _POSE_LATENT_KEYS = frozenset({
 })
 
 
+def _pose_guidance_alpha(
+    latent_key,
+    rotation_strength,
+    translation_strength,
+    scale_strength,
+):
+    if latent_key == "6drotation_normalized":
+        return rotation_strength
+    if latent_key in ("translation", "translation_scale"):
+        return translation_strength
+    if latent_key == "scale":
+        return scale_strength
+    return 0.0
+
+
 def encode_pose_to_latent(
     rotation, translation, scale,
     scene_scale, scene_shift, device=None,
@@ -744,6 +768,8 @@ def batched_guided_sample_sparse_structure(
     pipeline, ss_input_dict, z_target_flat, mesh_ss,
     num_samples=1,
     guidance_strength=0.7, pose_guidance_strength=0.0, pose_target=None,
+    pose_translation_guidance_strength=None,
+    pose_scale_guidance_strength=None,
     base_seed=42, inference_steps=None, verbose=True,
     pose_sde_strength=0.0,
     chunk_size=None,
@@ -770,6 +796,16 @@ def batched_guided_sample_sparse_structure(
     device = ss_input_dict["image"].device
     alpha = guidance_strength
     alpha_pose = pose_guidance_strength
+    alpha_pose_translation = (
+        alpha_pose
+        if pose_translation_guidance_strength is None
+        else float(pose_translation_guidance_strength)
+    )
+    alpha_pose_scale = (
+        alpha_pose
+        if pose_scale_guidance_strength is None
+        else float(pose_scale_guidance_strength)
+    )
     K = num_samples
 
     if chunk_size is None:
@@ -777,7 +813,7 @@ def batched_guided_sample_sparse_structure(
 
     # Resolve pose target to latent dict (shared across all samples)
     pose_target_latent = None
-    if alpha_pose > 0 and pose_target is not None:
+    if max(alpha_pose, alpha_pose_translation, alpha_pose_scale) > 0 and pose_target is not None:
         pose_target_latent = _prepare_pose_target_latent(
             pose_target, ss_input_dict, device,
         )
@@ -815,8 +851,11 @@ def batched_guided_sample_sparse_structure(
     if verbose:
         parts = [f"K={K}", f"{len(t_seq)-1} steps", f"chunk_size={chunk_size}",
                  f"alpha_shape={alpha:.2f}"]
-        if alpha_pose > 0:
-            parts.append(f"alpha_pose={alpha_pose:.2f}")
+        if max(alpha_pose, alpha_pose_translation, alpha_pose_scale) > 0:
+            parts.append(
+                "alpha_pose="
+                f"R{alpha_pose:.2f}/T{alpha_pose_translation:.2f}/S{alpha_pose_scale:.2f}"
+            )
         if pose_sde_strength > 0:
             parts.append(f"pose_sde={pose_sde_strength:.3f}")
         if _is_faster_gen:
@@ -885,11 +924,19 @@ def batched_guided_sample_sparse_structure(
                         x_next["shape"] = (1.0 - alpha) * x_next["shape"] + alpha * z_ref
 
                     # Pose guidance
-                    if alpha_pose > 0 and pose_target_latent is not None:
+                    if pose_target_latent is not None:
                         for k in _POSE_LATENT_KEYS:
+                            alpha_key = _pose_guidance_alpha(
+                                k,
+                                alpha_pose,
+                                alpha_pose_translation,
+                                alpha_pose_scale,
+                            )
+                            if alpha_key <= 0:
+                                continue
                             pt = pose_target_latent[k].expand(chunk_K, -1, -1).to(x_next[k].dtype)
                             z_ref_pose = (1.0 - t_next) * pose_noise[k] + t_next * pt
-                            x_next[k] = (1.0 - alpha_pose) * x_next[k] + alpha_pose * z_ref_pose
+                            x_next[k] = (1.0 - alpha_key) * x_next[k] + alpha_key * z_ref_pose
 
                     # SDE noise injection on pose channels only
                     if pose_sde_strength > 0:
@@ -957,6 +1004,8 @@ def batched_guided_sample_sparse_structure(
 def guided_sample_sparse_structure(
     pipeline, ss_input_dict, z_target_flat, mesh_ss,
     guidance_strength=0.7, pose_guidance_strength=0.0, pose_target=None,
+    pose_translation_guidance_strength=None,
+    pose_scale_guidance_strength=None,
     seed=42, inference_steps=None, verbose=True,
     pose_sde_strength=0.0,
     condition_args=None, condition_kwargs=None,
@@ -978,9 +1027,19 @@ def guided_sample_sparse_structure(
     device = img.device
     alpha = guidance_strength
     alpha_pose = pose_guidance_strength
+    alpha_pose_translation = (
+        alpha_pose
+        if pose_translation_guidance_strength is None
+        else float(pose_translation_guidance_strength)
+    )
+    alpha_pose_scale = (
+        alpha_pose
+        if pose_scale_guidance_strength is None
+        else float(pose_scale_guidance_strength)
+    )
 
     pose_target_latent = None
-    if alpha_pose > 0 and pose_target is not None:
+    if max(alpha_pose, alpha_pose_translation, alpha_pose_scale) > 0 and pose_target is not None:
         pose_target_latent = _prepare_pose_target_latent(
             pose_target, ss_input_dict, device,
         )
@@ -1036,8 +1095,11 @@ def guided_sample_sparse_structure(
 
             if verbose:
                 parts = [f"{len(t_seq)-1} steps", f"alpha_shape={alpha:.2f}"]
-                if alpha_pose > 0:
-                    parts.append(f"alpha_pose={alpha_pose:.2f}")
+                if max(alpha_pose, alpha_pose_translation, alpha_pose_scale) > 0:
+                    parts.append(
+                        "alpha_pose="
+                        f"R{alpha_pose:.2f}/T{alpha_pose_translation:.2f}/S{alpha_pose_scale:.2f}"
+                    )
                 if pose_sde_strength > 0:
                     parts.append(f"pose_sde={pose_sde_strength:.3f}")
                 logger.info(f"Guided sampling: {', '.join(parts)}")
@@ -1058,10 +1120,18 @@ def guided_sample_sparse_structure(
                     z_ref = (1.0 - t_next) * z_noise + t_next * z_target
                     x_next["shape"] = (1.0 - alpha) * x_next["shape"] + alpha * z_ref
 
-                if alpha_pose > 0 and pose_target_latent is not None:
+                if pose_target_latent is not None:
                     for k in _POSE_LATENT_KEYS:
+                        alpha_key = _pose_guidance_alpha(
+                            k,
+                            alpha_pose,
+                            alpha_pose_translation,
+                            alpha_pose_scale,
+                        )
+                        if alpha_key <= 0:
+                            continue
                         z_ref_pose = (1.0 - t_next) * pose_noise[k] + t_next * pose_target_latent[k].to(x_next[k].dtype)
-                        x_next[k] = (1.0 - alpha_pose) * x_next[k] + alpha_pose * z_ref_pose
+                        x_next[k] = (1.0 - alpha_key) * x_next[k] + alpha_key * z_ref_pose
 
                 if pose_sde_strength > 0:
                     sigma = 1.0 - t_next
@@ -1119,6 +1189,8 @@ def guided_sample_sparse_structure(
 def guided_predict_pose(
     pipeline, mesh_ss, rgba, z_target_flat, device,
     guidance_strength=0.7, pose_guidance_strength=0.0, pose_target=None,
+    pose_translation_guidance_strength=None,
+    pose_scale_guidance_strength=None,
     seed=42, post_optimize=False,
     init_trimesh=None, fixed_scale=None,
     pose_sde_strength=0.0,
@@ -1139,6 +1211,12 @@ def guided_predict_pose(
     ss_inference_steps=None,
     ll_steps=25,
     num_pose_samples_per_pgs=None,
+    candidate_pose_prior=None,
+    prior_translation_score_weight=0.0,
+    prior_rotation_score_weight=0.0,
+    history_context=None,
+    history_alignment_score_weight=0.0,
+    history_alignment_sigma=0.035,
 ):
     # Preprocess (once -- independent of seed)
     pointmap_dict = pipeline.compute_pointmap(rgba)
@@ -1179,6 +1257,8 @@ def guided_predict_pose(
                 guidance_strength=guidance_strength,
                 pose_guidance_strength=pgs_val,
                 pose_target=pose_target,
+                pose_translation_guidance_strength=pose_translation_guidance_strength,
+                pose_scale_guidance_strength=pose_scale_guidance_strength,
                 base_seed=seed + seed_offset,
                 inference_steps=ss_inference_steps,
                 verbose=False,
@@ -1196,6 +1276,8 @@ def guided_predict_pose(
             guidance_strength=guidance_strength,
             pose_guidance_strength=pose_guidance_strength,
             pose_target=pose_target,
+            pose_translation_guidance_strength=pose_translation_guidance_strength,
+            pose_scale_guidance_strength=pose_scale_guidance_strength,
             base_seed=seed,
             inference_steps=ss_inference_steps,
             verbose=False,
@@ -1274,15 +1356,41 @@ def guided_predict_pose(
             result["occlusion_visible_render_fraction"] = riou_details["visible_render_fraction"]
             result["occluder_pixels"] = riou_details["occluder_pixels"]
 
-        # Score selection
+        # Score selection.  Render IoU remains the image evidence; optional
+        # hand/history terms only act as soft priors on candidate ranking.
         if scoring_metric == "render_iou" and "render_iou" in result:
-            score = result["render_iou"]
+            base_score = result["render_iou"]
         else:
-            score = result["shape_iou"]
+            base_score = result["shape_iou"]
+        score = float(base_score)
+        result["base_selection_score"] = float(base_score)
+
+        if candidate_pose_prior is not None:
+            translation_error, rotation_error = pose_errors(
+                pose, candidate_pose_prior,
+            )
+            result["pose_prior_translation_error"] = translation_error
+            result["pose_prior_rotation_error_deg"] = float(np.rad2deg(rotation_error))
+            score -= float(prior_translation_score_weight) * translation_error
+            score -= float(prior_rotation_score_weight) * rotation_error
+
+        if history_context is not None:
+            alignment_score, median_residual = history_alignment_score(
+                pose, history_context,
+                sigma=history_alignment_sigma,
+            )
+            result["history_alignment_score"] = alignment_score
+            result["history_alignment_median_m"] = median_residual
+            score += float(history_alignment_score_weight) * alignment_score
+
+        result["selection_score"] = score
         all_samples.append(result)
 
         if num_pose_samples > 1:
-            logger.info(f"    sample {k+1}/{num_pose_samples} (seed={sample_seed}): score={score:.4f}")
+            logger.info(
+                f"    sample {k+1}/{num_pose_samples} (seed={sample_seed}): "
+                f"base={base_score:.4f}, score={score:.4f}"
+            )
 
         if score > best_score:
             best_score = score
@@ -1308,7 +1416,7 @@ def guided_predict_pose(
         elif pose_selection == "cluster":
             best_idx, cluster_info = cluster_pose_candidates(
                 all_samples,
-                scoring_metric=scoring_metric,
+                scoring_metric="selection_score",
                 dist_thresh=cluster_dist_thresh,
                 min_cluster_size=cluster_min_size,
                 w_trans=cluster_w_trans,
@@ -1620,6 +1728,28 @@ def process_video(args):
                      f"{all_frame_indices[:5]}...{all_frame_indices[-5:]}")
         return
 
+    pose_archive_frames = {}
+    if args.pose_archive is not None:
+        if not os.path.isfile(args.pose_archive):
+            logger.error(f"Pose archive not found: {args.pose_archive}")
+            return
+        pose_archive_frames, _ = load_pose_archive(args.pose_archive)
+        logger.info(
+            f"Loaded pose archive with {len(pose_archive_frames)} frames: "
+            f"{args.pose_archive}"
+        )
+
+    if args.pose_prior_mode == "hand" and not args.hand_meshes:
+        logger.error("--pose_prior_mode hand requires --hand_meshes")
+        return
+    if args.pose_prior_mode == "history":
+        if not args.pose_archive:
+            logger.error("--pose_prior_mode history requires --pose_archive")
+            return
+        if not args.history_pointmap_dir:
+            logger.error("--pose_prior_mode history requires --history_pointmap_dir")
+            return
+
     # ---- Load pipeline (Fast-SAM3D style) ----
     logger.info("Loading pipeline...")
     config_path = os.path.join(project_root, args.config)
@@ -1740,13 +1870,20 @@ def process_video(args):
         else None
     )
 
-    init_frame_result = load_frame_result_from_layout(masks_root, args.object_name, frame_idx=init_frame)
+    if init_frame in pose_archive_frames:
+        init_frame_result = deepcopy(pose_archive_frames[init_frame])
+        init_pose_source = f"pose archive {args.pose_archive}"
+    else:
+        init_frame_result = load_frame_result_from_layout(
+            masks_root, args.object_name, frame_idx=init_frame,
+        )
+        init_pose_source = "layout.json"
     if init_frame_result is None:
         logger.error(f"Could not load frame {init_frame} pose from layout.json. "
                      f"Run single-frame prediction for frame {init_frame} first.")
         return
-    init_frame_scale = init_frame_result["scale"]
-    logger.info(f"Loaded frame {init_frame} pose from layout.json "
+    init_frame_scale = result_to_pose(init_frame_result)["scale"]
+    logger.info(f"Loaded frame {init_frame} pose from {init_pose_source} "
                 f"(scale={init_frame_scale.squeeze().tolist()})")
 
     if init_frame != 0 and not args.chain_poses:
@@ -1793,6 +1930,79 @@ def process_video(args):
             logger.warning("--chain_poses requires --pose_guidance_strength > 0, "
                            "setting pose_guidance_strength to 0.5")
             args.pose_guidance_strength = 0.5
+
+    pose_prior_provider = None
+    history_pool_summary = None
+    if args.pose_prior_mode == "hand":
+        hand_anchor_frame = (
+            init_frame if args.hand_anchor_frame is None else args.hand_anchor_frame
+        )
+        if hand_anchor_frame in pose_archive_frames:
+            hand_anchor_pose = result_to_pose(pose_archive_frames[hand_anchor_frame])
+        elif hand_anchor_frame == init_frame:
+            hand_anchor_pose = result_to_pose(init_frame_result)
+        else:
+            logger.error(
+                f"Hand anchor frame {hand_anchor_frame} is unavailable; provide it "
+                "through --pose_archive or use --init_frame"
+            )
+            return
+        try:
+            pose_prior_provider = HandObjectPosePrior(
+                args.hand_meshes,
+                anchor_frame=hand_anchor_frame,
+                anchor_pose=hand_anchor_pose,
+                hand=args.hand_side,
+                jump_translation_threshold=args.hand_jump_translation_threshold,
+                jump_rotation_threshold_deg=args.hand_jump_rotation_threshold_deg,
+                flip_xy_to_pytorch3d=args.hand_flip_xy_to_pytorch3d,
+            )
+        except (OSError, KeyError, ValueError, IndexError) as exc:
+            logger.error(f"Failed to initialize hand pose prior: {exc}")
+            return
+        logger.info(
+            f"Hand-object pose prior: hand={args.hand_side}, "
+            f"anchor={hand_anchor_frame}, detected resets="
+            f"{pose_prior_provider.reset_frames}"
+        )
+    elif args.pose_prior_mode == "history":
+        history_occluder_name = args.history_occluder_name
+        if history_occluder_name is None and occluder_mask_names:
+            history_occluder_name = occluder_mask_names[0]
+        try:
+            pose_prior_provider = HistoryMemoryPosePrior(
+                pose_archive_path=args.pose_archive,
+                frames_dir=os.path.join(args.vid_dir, "all_frames"),
+                masks_root=masks_root,
+                pointmap_dir=args.history_pointmap_dir,
+                object_name=args.object_name,
+                occluder_masks_root=args.occluder_masks_root,
+                occluder_name=history_occluder_name,
+                history_start_frame=args.history_start_frame,
+                history_end_frame=args.history_end_frame,
+                pool_size=args.history_pool_size,
+                min_frame_gap=args.history_min_frame_gap,
+                occluder_dilation_px=args.occluder_dilation_px,
+                max_keyframes=args.history_max_keyframes,
+                lookback=args.history_lookback,
+                min_matches=args.history_min_matches,
+                match_ratio=args.history_match_ratio,
+                ransac_threshold=args.history_ransac_threshold,
+                ransac_iterations=args.history_ransac_iterations,
+                flip_xy_to_pytorch3d=args.history_flip_xy_to_pytorch3d,
+            )
+        except (OSError, KeyError, ValueError) as exc:
+            logger.error(f"Failed to initialize history pose prior: {exc}")
+            return
+        history_pool_summary = pose_prior_provider.pool_summary()
+        logger.info(
+            "History memory pool: "
+            + ", ".join(
+                f"f{item['frame_idx']}(q={item['quality']:.3f}, "
+                f"occ={item['hand_occlusion']:.2f})"
+                for item in history_pool_summary
+            )
+        )
 
     render_mesh = None
     image_hw = None
@@ -1868,6 +2078,47 @@ def process_video(args):
                     f"  Frame {frame_idx}: no occluder masks found; using raw render IoU"
                 )
 
+        frame_pose_target = pose_target
+        candidate_pose_prior = None
+        history_context = None
+        pose_prior_diagnostics = {"mode": "none"}
+        decoded_coarse_pose = (
+            pose_target
+            if pose_target is not None
+            and all(key in pose_target for key in ("rotation", "translation", "scale"))
+            else None
+        )
+        if args.pose_prior_mode == "hand":
+            prior_pose, pose_prior_diagnostics = pose_prior_provider.get_pose(frame_idx)
+            if prior_pose is not None:
+                if args.hand_use_chain_translation and decoded_coarse_pose is not None:
+                    chain_pose = copy_pose(decoded_coarse_pose)
+                    prior_pose["translation"] = chain_pose["translation"]
+                    prior_pose["scale"] = chain_pose["scale"]
+                    pose_prior_diagnostics["translation_source"] = "chained_pose"
+                else:
+                    pose_prior_diagnostics["translation_source"] = "hand_propagation"
+                frame_pose_target = prior_pose
+                candidate_pose_prior = prior_pose
+        elif args.pose_prior_mode == "history":
+            prior_pose, history_context, pose_prior_diagnostics = (
+                pose_prior_provider.estimate(
+                    frame_idx,
+                    image,
+                    mask > 0,
+                    decoded_coarse_pose,
+                )
+            )
+            if prior_pose is not None:
+                frame_pose_target = prior_pose
+                candidate_pose_prior = prior_pose
+
+        if args.pose_prior_mode != "none":
+            logger.info(
+                "  Pose prior: "
+                + json.dumps(pose_prior_diagnostics, ensure_ascii=False)
+            )
+
         rgba = np.concatenate(
             [image[..., :3], (mask.astype(np.uint8) * 255)[..., None]], axis=-1
         )
@@ -1894,11 +2145,26 @@ def process_video(args):
         else:
             frame_pose_strength = args.pose_guidance_strength
 
+        if args.pose_translation_guidance_strength is None:
+            frame_translation_strength = (
+                0.0 if args.pose_prior_mode == "hand" else frame_pose_strength
+            )
+        else:
+            frame_translation_strength = args.pose_translation_guidance_strength
+        if args.pose_scale_guidance_strength is None:
+            frame_scale_strength = (
+                0.0 if args.fix_scale_to_init_frame else frame_translation_strength
+            )
+        else:
+            frame_scale_strength = args.pose_scale_guidance_strength
+
         result = guided_predict_pose(
             pipeline, mesh_ss, rgba, z_target_flat, device,
             guidance_strength=args.guidance_strength,
             pose_guidance_strength=frame_pose_strength,
-            pose_target=pose_target,
+            pose_target=frame_pose_target,
+            pose_translation_guidance_strength=frame_translation_strength,
+            pose_scale_guidance_strength=frame_scale_strength,
             seed=args.seed,
             post_optimize=args.post_optimize,
             init_trimesh=init_trimesh,
@@ -1921,10 +2187,17 @@ def process_video(args):
             ss_inference_steps=args.ss_inference_steps,
             ll_steps=args.ll_steps,
             num_pose_samples_per_pgs=args.num_pose_samples_per_pgs,
+            candidate_pose_prior=candidate_pose_prior,
+            prior_translation_score_weight=args.prior_translation_score_weight,
+            prior_rotation_score_weight=args.prior_rotation_score_weight,
+            history_context=history_context,
+            history_alignment_score_weight=args.history_alignment_score_weight,
+            history_alignment_sigma=args.history_alignment_sigma,
         )
 
         torch.cuda.synchronize()
         result["frame_time_s"] = time.perf_counter() - _t0
+        result["pose_prior_diagnostics"] = pose_prior_diagnostics
         result.pop("x1_latent", None)  # strip large latent before saving
 
         # Save all K samples to a separate file
@@ -1962,6 +2235,12 @@ def process_video(args):
                 )
             else:
                 msg += f", render_IoU={result['render_iou']:.4f}"
+        if "selection_score" in result:
+            msg += f", selection={result['selection_score']:.4f}"
+        if "pose_prior_rotation_error_deg" in result:
+            msg += f", prior_R_err={result['pose_prior_rotation_error_deg']:.1f}deg"
+        if "history_alignment_median_m" in result:
+            msg += f", history_med={result['history_alignment_median_m']:.4f}m"
         logger.info(msg)
 
         all_results[frame_idx] = result
@@ -2039,6 +2318,8 @@ def process_video(args):
         "euler_steps": args.euler_steps if args.euler_steps is not None else ss_gen.inference_steps,
         "guidance_strength": args.guidance_strength,
         "pose_guidance_strength": args.pose_guidance_strength,
+        "pose_translation_guidance_strength": args.pose_translation_guidance_strength,
+        "pose_scale_guidance_strength": args.pose_scale_guidance_strength,
         "pose_sde_strength": args.pose_sde_strength,
         "num_pose_samples": args.num_pose_samples,
         "scoring_metric": args.scoring_metric,
@@ -2054,6 +2335,17 @@ def process_video(args):
         "enable_ss_cache": args.enable_ss_cache,
         "torch_compile": args.torch_compile,
         "batch_chunk_size": args.batch_chunk_size,
+        "pose_prior_mode": args.pose_prior_mode,
+        "pose_archive": args.pose_archive,
+        "hand_meshes": args.hand_meshes,
+        "hand_side": args.hand_side if args.pose_prior_mode == "hand" else None,
+        "hand_anchor_frame": (
+            args.hand_anchor_frame if args.pose_prior_mode == "hand" else None
+        ),
+        "prior_translation_score_weight": args.prior_translation_score_weight,
+        "prior_rotation_score_weight": args.prior_rotation_score_weight,
+        "history_alignment_score_weight": args.history_alignment_score_weight,
+        "history_memory_pool": history_pool_summary,
         "frames": all_results,
     }
     save_path = os.path.join(args.output_dir, "guided_poses.pt")
@@ -2099,8 +2391,60 @@ def main():
     parser.add_argument("--guidance_strength", type=float, default=0.7, help="Shape guidance alpha")
     parser.add_argument("--pose_guidance_strength", type=float, default=0.0,
                         help="Pose guidance alpha")
+    parser.add_argument("--pose_translation_guidance_strength", type=float, default=None,
+                        help="Translation/translation-scale guidance alpha. Default: use pose guidance alpha; hand prior mode defaults to 0.")
+    parser.add_argument("--pose_scale_guidance_strength", type=float, default=None,
+                        help="Scale guidance alpha. Default: use translation alpha, or 0 with fixed scale.")
     parser.add_argument("--pose_target_file", default=None,
                         help="Path to .pt file with target pose")
+    parser.add_argument("--pose_archive", default=None,
+                        help="Existing guided_poses.pt used for a non-layout init frame and prior anchors/keyframes")
+    parser.add_argument("--pose_prior_mode", default="none",
+                        choices=["none", "hand", "history"],
+                        help="Additional pose prior: hand-object propagation or low-occlusion history memory")
+    parser.add_argument("--prior_translation_score_weight", type=float, default=0.0,
+                        help="Candidate penalty per metre from the active pose prior")
+    parser.add_argument("--prior_rotation_score_weight", type=float, default=0.0,
+                        help="Candidate penalty per radian from the active pose prior")
+
+    # --- Hand-object relative pose prior ---
+    parser.add_argument("--hand_meshes", default=None,
+                        help="HaWoR all_hand_meshes.npz")
+    parser.add_argument("--hand_side", default="right", choices=["left", "right"])
+    parser.add_argument("--hand_anchor_frame", type=int, default=None,
+                        help="Reliable grasp frame defining T_hand_object; defaults to init frame")
+    parser.add_argument("--hand_use_chain_translation", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Use chained SAM3D translation while taking rotation from the hand prior")
+    parser.add_argument("--hand_flip_xy_to_pytorch3d", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Convert HaWoR camera x/y axes to PyTorch3D axes")
+    parser.add_argument("--hand_jump_translation_threshold", type=float, default=0.15,
+                        help="Metres above which a HaWoR coordinate reset is stitched")
+    parser.add_argument("--hand_jump_rotation_threshold_deg", type=float, default=60.0,
+                        help="Degrees above which a HaWoR coordinate reset is stitched")
+
+    # --- EgoAERO-inspired low-occlusion history memory ---
+    parser.add_argument("--history_pointmap_dir", default=None,
+                        help="Directory containing NNNNNN_pointmap.npy RGB-D point maps")
+    parser.add_argument("--history_occluder_name", default=None,
+                        help="Hand mask name for memory quality; defaults to first occluder mask name")
+    parser.add_argument("--history_start_frame", type=int, default=0)
+    parser.add_argument("--history_end_frame", type=int, default=None)
+    parser.add_argument("--history_pool_size", type=int, default=24)
+    parser.add_argument("--history_min_frame_gap", type=int, default=3)
+    parser.add_argument("--history_max_keyframes", type=int, default=4)
+    parser.add_argument("--history_lookback", type=int, default=120)
+    parser.add_argument("--history_min_matches", type=int, default=8)
+    parser.add_argument("--history_match_ratio", type=float, default=0.78)
+    parser.add_argument("--history_ransac_threshold", type=float, default=0.035)
+    parser.add_argument("--history_ransac_iterations", type=int, default=384)
+    parser.add_argument("--history_flip_xy_to_pytorch3d", action=argparse.BooleanOptionalAction,
+                        default=True)
+    parser.add_argument("--history_alignment_score_weight", type=float, default=0.0,
+                        help="Positive candidate reward for RGB-D history alignment")
+    parser.add_argument("--history_alignment_sigma", type=float, default=0.035,
+                        help="Metre scale for converting median history residual to a score")
     parser.add_argument("--latent_opt_steps", type=int, default=1000, help="Decoder inversion steps")
     parser.add_argument("--latent_opt_lr", type=float, default=0.05, help="Decoder inversion LR")
     parser.add_argument("--post_optimize", action="store_true", help="Run post-optimization")
