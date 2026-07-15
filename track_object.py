@@ -1987,6 +1987,7 @@ def process_video(args):
                 lookback=args.history_lookback,
                 min_matches=args.history_min_matches,
                 match_ratio=args.history_match_ratio,
+                feature_mask_dilation_px=args.history_feature_mask_dilation_px,
                 ransac_threshold=args.history_ransac_threshold,
                 ransac_iterations=args.history_ransac_iterations,
                 flip_xy_to_pytorch3d=args.history_flip_xy_to_pytorch3d,
@@ -2437,6 +2438,7 @@ def main():
     parser.add_argument("--history_lookback", type=int, default=120)
     parser.add_argument("--history_min_matches", type=int, default=8)
     parser.add_argument("--history_match_ratio", type=float, default=0.78)
+    parser.add_argument("--history_feature_mask_dilation_px", type=int, default=6)
     parser.add_argument("--history_ransac_threshold", type=float, default=0.035)
     parser.add_argument("--history_ransac_iterations", type=int, default=384)
     parser.add_argument("--history_flip_xy_to_pytorch3d", action=argparse.BooleanOptionalAction,

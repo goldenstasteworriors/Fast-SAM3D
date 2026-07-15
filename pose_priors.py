@@ -370,6 +370,7 @@ class HistoryMemoryPosePrior:
         lookback: int = 120,
         min_matches: int = 8,
         match_ratio: float = 0.78,
+        feature_mask_dilation_px: int = 6,
         ransac_threshold: float = 0.035,
         ransac_iterations: int = 384,
         flip_xy_to_pytorch3d: bool = True,
@@ -388,6 +389,7 @@ class HistoryMemoryPosePrior:
         self.lookback = int(lookback)
         self.min_matches = int(min_matches)
         self.match_ratio = float(match_ratio)
+        self.feature_mask_dilation_px = int(feature_mask_dilation_px)
         self.ransac_threshold = float(ransac_threshold)
         self.ransac_iterations = int(ransac_iterations)
         self.flip_xy_to_pytorch3d = bool(flip_xy_to_pytorch3d)
@@ -438,16 +440,23 @@ class HistoryMemoryPosePrior:
                 + 0.35 * (1.0 - frame.hand_occlusion)
             )
 
-        # Quality first, but enforce temporal diversity before truncating.
+        # Select the best observation inside temporal bins.  Pure quality
+        # ranking over-fills the pool with early, large silhouettes and loses
+        # the recent viewpoints needed by the current frame.
+        chronological = sorted(candidates, key=lambda item: item.frame_idx)
         selected: list[_MemoryFrame] = []
-        for candidate in sorted(candidates, key=lambda item: item.quality, reverse=True):
+        for indices in np.array_split(
+            np.arange(len(chronological)), min(int(pool_size), len(chronological))
+        ):
+            if len(indices) == 0:
+                continue
+            bin_candidates = [chronological[int(index)] for index in indices]
+            candidate = max(bin_candidates, key=lambda item: item.quality)
             if all(
                 abs(candidate.frame_idx - existing.frame_idx) >= min_frame_gap
                 for existing in selected
             ):
                 selected.append(candidate)
-            if len(selected) >= int(pool_size):
-                break
         self.pool = sorted(selected, key=lambda item: item.frame_idx)
 
     def _image_path(self, frame_idx: int) -> Path:
@@ -489,7 +498,7 @@ class HistoryMemoryPosePrior:
         return float((object_mask & ignored).sum()) / max(int(object_mask.sum()), 1)
 
     def _feature_mask(self, frame_idx: int, object_mask: np.ndarray) -> np.ndarray:
-        mask = _dilate(object_mask, 2)
+        mask = _dilate(object_mask, self.feature_mask_dilation_px)
         if self.occluder_masks_root is not None and self.occluder_name:
             path = (
                 self.occluder_masks_root
@@ -612,11 +621,29 @@ class HistoryMemoryPosePrior:
                 frame_idx, image, object_mask, memory
             )
             match_sets.append((memory, canonical, current, raw_matches))
-        match_sets.sort(
-            key=lambda item: (item[1].shape[0], item[0].quality), reverse=True
-        )
+        def relevance(item):
+            memory, canonical, _, _ = item
+            match_score = min(canonical.shape[0] / max(self.min_matches, 1), 1.0)
+            recency_score = np.exp(
+                -(frame_idx - memory.frame_idx) / max(self.lookback / 3.0, 1.0)
+            )
+            rotation_score = 0.5
+            if coarse_pose is not None:
+                _, rotation_error = pose_errors(memory.pose, coarse_pose)
+                rotation_score = np.exp(-rotation_error / np.deg2rad(45.0))
+            return float(
+                0.40 * match_score
+                + 0.25 * memory.quality
+                + 0.20 * recency_score
+                + 0.15 * rotation_score
+            )
+
+        match_sets.sort(key=relevance, reverse=True)
         selected = match_sets[: self.max_keyframes]
         diagnostics["selected_keyframes"] = [item[0].frame_idx for item in selected]
+        diagnostics["selection_scores"] = {
+            item[0].frame_idx: relevance(item) for item in selected
+        }
         diagnostics["matches_per_keyframe"] = {
             item[0].frame_idx: int(item[1].shape[0]) for item in selected
         }
@@ -676,7 +703,7 @@ class HistoryMemoryPosePrior:
         # Transparent objects often provide too few trustworthy RGB features.
         # Fall back to the best low-occlusion keyframe as a conservative
         # rotation prior; current-frame translation remains the coarse pose.
-        best_memory = max(eligible, key=lambda item: item.quality)
+        best_memory = max(selected, key=relevance)[0]
         fallback = copy_pose(best_memory.pose)
         if coarse_pose is not None:
             fallback["translation"] = copy_pose(coarse_pose)["translation"]
