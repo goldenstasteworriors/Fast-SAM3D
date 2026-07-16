@@ -341,6 +341,97 @@ def _compute_binary_iou(render_binary, gt_binary, valid_mask=None):
     return float(intersection) / float(union)
 
 
+def _visible_component_scores(
+    render_binary,
+    gt_binary,
+    occluder_binary=None,
+    min_area_px=20,
+    bridge_dilation_px=2,
+):
+    """Score every visible object component and its connection behind an occluder.
+
+    Standard IoU weights components by area and can therefore ignore a small
+    visible fragment.  Here every sufficiently large connected component has
+    equal importance.  The bridge score additionally requires one connected
+    part of the *full* rendered silhouette to touch all visible components
+    through the object-or-occluder support region.
+    """
+    render_binary = np.asarray(render_binary, dtype=bool)
+    gt_binary = np.asarray(gt_binary, dtype=bool)
+    if occluder_binary is None:
+        occluder_binary = np.zeros_like(gt_binary, dtype=bool)
+    else:
+        occluder_binary = np.asarray(occluder_binary, dtype=bool)
+
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        gt_binary.astype(np.uint8), connectivity=8,
+    )
+    components = [
+        {
+            "label": int(index),
+            "area": int(stats[index, cv2.CC_STAT_AREA]),
+            "centroid": centroids[index].astype(np.float64),
+            "mask": labels == index,
+        }
+        for index in range(1, count)
+        if int(stats[index, cv2.CC_STAT_AREA]) >= int(min_area_px)
+    ]
+    components.sort(key=lambda item: item["area"], reverse=True)
+    if not components:
+        return {
+            "component_count": 0,
+            "component_areas": [],
+            "component_centroids": [],
+            "component_recalls": [],
+            "component_balance": 0.0,
+            "component_bridge": 0.0,
+        }
+
+    # Use the raw hand mask here.  The dilated mask remains useful for a
+    # tolerant global IoU, but must not erase a small, genuinely visible part.
+    visible_render = render_binary & ~occluder_binary
+    recalls = [
+        float((visible_render & item["mask"]).sum()) / max(item["area"], 1)
+        for item in components
+    ]
+    component_balance = float(min(recalls))
+
+    if len(components) == 1:
+        component_bridge = recalls[0]
+    else:
+        dilation = max(int(bridge_dilation_px), 0)
+        if dilation > 0:
+            kernel_size = 2 * dilation + 1
+            kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+            bridge_occluder = cv2.dilate(
+                occluder_binary.astype(np.uint8), kernel, iterations=1,
+            ).astype(bool)
+        else:
+            bridge_occluder = occluder_binary
+        support_region = gt_binary | bridge_occluder
+        supported_render = render_binary & support_region
+        bridge_count, bridge_labels = cv2.connectedComponents(
+            supported_render.astype(np.uint8), connectivity=8,
+        )
+        component_bridge = 0.0
+        for bridge_label in range(1, bridge_count):
+            candidate = bridge_labels == bridge_label
+            touch_recalls = [
+                float((candidate & item["mask"]).sum()) / max(item["area"], 1)
+                for item in components
+            ]
+            component_bridge = max(component_bridge, min(touch_recalls))
+
+    return {
+        "component_count": len(components),
+        "component_areas": [item["area"] for item in components],
+        "component_centroids": [item["centroid"].tolist() for item in components],
+        "component_recalls": recalls,
+        "component_balance": component_balance,
+        "component_bridge": float(component_bridge),
+    }
+
+
 def compute_render_iou(
     mesh,
     pose_dict,
@@ -352,6 +443,8 @@ def compute_render_iou(
     renderer=None,
     occluder_mask=None,
     occluder_dilation_px=0,
+    component_min_area_px=20,
+    component_bridge_dilation_px=2,
     return_details=False,
 ):
     alpha = _render_silhouette(mesh, pose_dict, intrinsics_3x3, width, height, device, renderer=renderer)
@@ -364,6 +457,7 @@ def compute_render_iou(
     ignored_gt_fraction = 0.0
     visible_render_fraction = 1.0
     occluder_pixels = 0
+    raw_occluder_binary = None
 
     if occluder_mask is not None:
         occluder_binary = np.asarray(occluder_mask) > 0
@@ -373,6 +467,7 @@ def compute_render_iou(
                 (gt_binary.shape[1], gt_binary.shape[0]),
                 interpolation=cv2.INTER_NEAREST,
             ).astype(bool)
+        raw_occluder_binary = occluder_binary.copy()
         if occluder_dilation_px > 0:
             kernel_size = 2 * int(occluder_dilation_px) + 1
             kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
@@ -394,6 +489,14 @@ def compute_render_iou(
         if render_pixels > 0:
             visible_render_fraction = float((render_binary & valid_mask).sum()) / float(render_pixels)
 
+    component_details = _visible_component_scores(
+        render_binary,
+        gt_binary,
+        occluder_binary=raw_occluder_binary,
+        min_area_px=component_min_area_px,
+        bridge_dilation_px=component_bridge_dilation_px,
+    )
+
     details = {
         "score_iou": score_iou,
         "raw_iou": raw_iou,
@@ -401,8 +504,143 @@ def compute_render_iou(
         "ignored_gt_fraction": ignored_gt_fraction,
         "visible_render_fraction": visible_render_fraction,
         "occluder_pixels": occluder_pixels,
+        **component_details,
     }
     return details if return_details else score_iou
+
+
+def _align_vector_rotation(source, target):
+    """Return the minimum 3D rotation taking ``source`` onto ``target``."""
+    source = np.asarray(source, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    source /= max(float(np.linalg.norm(source)), 1e-12)
+    target /= max(float(np.linalg.norm(target)), 1e-12)
+    cosine = float(np.clip(np.dot(source, target), -1.0, 1.0))
+    cross = np.cross(source, target)
+    sine = float(np.linalg.norm(cross))
+    if sine < 1e-8:
+        if cosine > 0.0:
+            return np.eye(3, dtype=np.float64)
+        basis = np.eye(3)[int(np.argmin(np.abs(source)))]
+        axis = np.cross(source, basis)
+        axis /= max(float(np.linalg.norm(axis)), 1e-12)
+        return ScipyRotation.from_rotvec(np.pi * axis).as_matrix()
+    axis = cross / sine
+    angle = float(np.arctan2(sine, cosine))
+    return ScipyRotation.from_rotvec(angle * axis).as_matrix()
+
+
+def _component_axis_pose_hypotheses(
+    base_pose,
+    gt_mask,
+    intrinsics_3x3,
+    image_hw,
+    rendered_canonical_axis,
+    depth_angles_deg,
+    min_area_px=20,
+):
+    """Generate poses whose rendered object axis joins visible mask pieces.
+
+    The image-space direction is fixed by the two largest visible components;
+    depth remains ambiguous and is represented by explicit hypotheses.
+    Translation is recentered on the equal-weight component midpoint so the
+    small fragment cannot be overwhelmed by the large one.
+    """
+    diagnostics = {"active": False, "reason": "insufficient_components"}
+    if base_pose is None or gt_mask is None or rendered_canonical_axis is None:
+        return [], diagnostics
+
+    gt_binary = np.asarray(gt_mask) > 0
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        gt_binary.astype(np.uint8), connectivity=8,
+    )
+    components = [
+        (int(stats[index, cv2.CC_STAT_AREA]), centroids[index].astype(np.float64))
+        for index in range(1, count)
+        if int(stats[index, cv2.CC_STAT_AREA]) >= int(min_area_px)
+    ]
+    components.sort(key=lambda item: item[0], reverse=True)
+    if len(components) < 2:
+        return [], diagnostics
+
+    first, second = components[:2]
+    image_direction = second[1] - first[1]
+    if float(np.linalg.norm(image_direction)) < 2.0:
+        diagnostics["reason"] = "degenerate_component_direction"
+        return [], diagnostics
+
+    height, width = image_hw
+    intrinsics = np.asarray(
+        intrinsics_3x3.detach().cpu() if torch.is_tensor(intrinsics_3x3) else intrinsics_3x3,
+        dtype=np.float64,
+    ).squeeze()
+    fx = float(intrinsics[0, 0] * width)
+    fy = float(intrinsics[1, 1] * height)
+    cx = float(intrinsics[0, 2] * width)
+    cy = float(intrinsics[1, 2] * height)
+    screen_axis = np.array(
+        [-image_direction[0] / max(fx, 1e-8),
+         -image_direction[1] / max(fy, 1e-8),
+         0.0],
+        dtype=np.float64,
+    )
+    screen_axis /= max(float(np.linalg.norm(screen_axis)), 1e-12)
+
+    base_rotation_tensor = base_pose["rotation"].detach().cpu()
+    base_translation_tensor = base_pose["translation"].detach().cpu()
+    base_quaternion = base_rotation_tensor.reshape(-1, 4)[0].numpy().astype(np.float64)
+    base_rotation = ScipyRotation.from_quat(
+        base_quaternion, scalar_first=True,
+    ).as_matrix()
+    canonical_axis = np.asarray(rendered_canonical_axis, dtype=np.float64)
+    canonical_axis /= max(float(np.linalg.norm(canonical_axis)), 1e-12)
+    source_axis = base_rotation @ canonical_axis
+
+    translation = base_translation_tensor.reshape(-1, 3)[0].numpy().astype(np.float64)
+    target_center = 0.5 * (first[1] + second[1])
+    z = max(float(translation[2]), 1e-4)
+    projected_u = cx - fx * float(translation[0]) / z
+    projected_v = cy - fy * float(translation[1]) / z
+    recentered_translation = translation.copy()
+    recentered_translation[0] -= (target_center[0] - projected_u) * z / max(fx, 1e-8)
+    recentered_translation[1] -= (target_center[1] - projected_v) * z / max(fy, 1e-8)
+
+    hypotheses = []
+    target_axes = []
+    for depth_angle_deg in depth_angles_deg:
+        angle = float(np.deg2rad(depth_angle_deg))
+        target_axis = (
+            np.cos(angle) * screen_axis
+            + np.sin(angle) * np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        )
+        target_axis /= max(float(np.linalg.norm(target_axis)), 1e-12)
+        delta = _align_vector_rotation(source_axis, target_axis)
+        rotation = delta @ base_rotation
+        quaternion = ScipyRotation.from_matrix(rotation).as_quat(scalar_first=True)
+        hypothesis = copy_pose(base_pose)
+        hypothesis["rotation"] = torch.as_tensor(
+            quaternion,
+            dtype=base_rotation_tensor.dtype,
+        ).reshape(base_rotation_tensor.shape)
+        hypothesis["translation"] = torch.as_tensor(
+            recentered_translation,
+            dtype=base_translation_tensor.dtype,
+        ).reshape(base_translation_tensor.shape)
+        hypotheses.append(hypothesis)
+        target_axes.append(target_axis.tolist())
+
+    diagnostics = {
+        "active": bool(hypotheses),
+        "component_areas": [first[0], second[0]],
+        "component_centroids": [first[1].tolist(), second[1].tolist()],
+        "image_axis_angle_deg": float(
+            np.rad2deg(np.arctan2(image_direction[1], image_direction[0]))
+        ),
+        "target_center": target_center.tolist(),
+        "depth_angles_deg": [float(value) for value in depth_angles_deg],
+        "target_axes": target_axes,
+    }
+    return hypotheses, diagnostics
 
 
 # ------------------------------------------------------------------
@@ -1238,6 +1476,15 @@ def guided_predict_pose(
     gt_mask=None,
     occluder_mask=None,
     occluder_dilation_px=0,
+    render_raw_iou_score_weight=0.0,
+    component_balance_score_weight=0.0,
+    component_bridge_score_weight=0.0,
+    component_min_area_px=20,
+    component_bridge_dilation_px=2,
+    component_axis_guidance=False,
+    component_axis_base_pose=None,
+    component_axis_rendered_canonical_axis=None,
+    component_axis_depth_angles_deg=None,
     image_hw=None,
     enable_shape_icp=True,
     pose_selection="greedy",
@@ -1282,6 +1529,39 @@ def guided_predict_pose(
             with torch.autocast(device_type="cuda", dtype=pipeline.dtype):
                 dm_output = pipeline.depth_model(loaded_img_t)
         intrinsics = dm_output["intrinsics"].detach().cpu()
+
+    component_axis_hypotheses = []
+    component_axis_diagnostics = {"active": False, "reason": "disabled"}
+    if component_axis_guidance:
+        axis_base_pose = component_axis_base_pose
+        if axis_base_pose is None and pose_target is not None:
+            axis_base_pose = pose_target[0] if isinstance(pose_target, list) else pose_target
+        angles = (
+            component_axis_depth_angles_deg
+            if component_axis_depth_angles_deg is not None
+            else [-70.0, -50.0, -30.0, -10.0, 0.0, 10.0, 30.0, 50.0, 70.0]
+        )
+        component_axis_hypotheses, component_axis_diagnostics = (
+            _component_axis_pose_hypotheses(
+                axis_base_pose,
+                gt_mask,
+                intrinsics.squeeze(),
+                image_hw,
+                component_axis_rendered_canonical_axis,
+                angles,
+                min_area_px=component_min_area_px,
+            )
+        )
+        if component_axis_hypotheses:
+            # Replace image-ambiguous hand hypotheses.  Each depth angle now
+            # receives diffusion samples instead of being considered only in
+            # post-hoc scoring.
+            pose_target = component_axis_hypotheses
+            logger.info(
+                "  Component-axis guidance: "
+                f"{len(component_axis_hypotheses)} modes, "
+                f"image_angle={component_axis_diagnostics['image_axis_angle_deg']:.1f}deg"
+            )
 
     # Build renderer once for render_iou scoring
     frame_renderer = None
@@ -1392,6 +1672,8 @@ def guided_predict_pose(
                 gt_mask, W, H, device, renderer=frame_renderer,
                 occluder_mask=occluder_mask,
                 occluder_dilation_px=occluder_dilation_px,
+                component_min_area_px=component_min_area_px,
+                component_bridge_dilation_px=component_bridge_dilation_px,
                 return_details=True,
             )
             result["render_iou"] = riou_details["score_iou"]
@@ -1400,6 +1682,19 @@ def guided_predict_pose(
             result["occlusion_ignored_gt_fraction"] = riou_details["ignored_gt_fraction"]
             result["occlusion_visible_render_fraction"] = riou_details["visible_render_fraction"]
             result["occluder_pixels"] = riou_details["occluder_pixels"]
+            result["visible_component_count"] = riou_details["component_count"]
+            result["visible_component_areas"] = riou_details["component_areas"]
+            result["visible_component_recalls"] = riou_details["component_recalls"]
+            result["visible_component_balance"] = riou_details["component_balance"]
+            result["occlusion_bridge_score"] = riou_details["component_bridge"]
+            if component_axis_hypotheses:
+                result["component_axis_hypothesis"] = (
+                    k % len(component_axis_hypotheses)
+                )
+                result["component_axis_depth_angle_deg"] = float(
+                    component_axis_diagnostics["depth_angles_deg"]
+                    [result["component_axis_hypothesis"]]
+                )
 
         # Score selection.  Render IoU remains the image evidence; optional
         # hand/history terms only act as soft priors on candidate ranking.
@@ -1409,6 +1704,16 @@ def guided_predict_pose(
             base_score = result["shape_iou"]
         score = float(base_score)
         result["base_selection_score"] = float(base_score)
+        if scoring_metric == "render_iou" and "render_iou" in result:
+            score += float(render_raw_iou_score_weight) * float(
+                result.get("render_iou_raw", 0.0)
+            )
+            score += float(component_balance_score_weight) * float(
+                result.get("visible_component_balance", 0.0)
+            )
+            score += float(component_bridge_score_weight) * float(
+                result.get("occlusion_bridge_score", 0.0)
+            )
 
         active_priors = candidate_pose_priors
         if active_priors is None and candidate_pose_prior is not None:
@@ -1531,6 +1836,8 @@ def guided_predict_pose(
                 f"score={best_score:.4f} (seed={best_result['sample_seed']})"
             )
         best_result["all_samples"] = all_samples
+
+    best_result["component_axis_diagnostics"] = component_axis_diagnostics
 
     # Run post-optimization on the best sample only
     if post_optimize and init_trimesh is not None:
@@ -1765,6 +2072,18 @@ def process_video(args):
 
     device = torch.device(args.device)
     init_frame = args.init_frame
+    try:
+        component_axis_depth_angles_deg = [
+            float(value.strip())
+            for value in args.component_axis_depth_angles_deg.split(",")
+            if value.strip()
+        ]
+    except ValueError:
+        logger.error("--component_axis_depth_angles_deg must be comma-separated numbers")
+        return
+    if args.component_axis_guidance and not component_axis_depth_angles_deg:
+        logger.error("--component_axis_guidance requires at least one depth angle")
+        return
 
     masks_root = args.masks_root if args.masks_root else os.path.join(args.vid_dir, "video_segmentation", "masks")
     occluder_mask_names = [
@@ -1970,10 +2289,25 @@ def process_video(args):
             args.post_optimize
             or args.save_layout
             or args.scoring_metric == "render_iou"
+            or args.component_axis_guidance
             or args.pose_prior_mode in {"grasp_type", "hand_contact", "hand_fusion"}
         )
         else None
     )
+    rendered_mesh_vertices = None
+    rendered_canonical_axis = None
+    if init_trimesh is not None:
+        rendered_mesh_vertices = (
+            np.asarray(init_trimesh.vertices, dtype=np.float64)
+            @ _R_YUP_TO_ZUP_RENDER.astype(np.float64)
+        )
+        centered_rendered_vertices = (
+            rendered_mesh_vertices - rendered_mesh_vertices.mean(axis=0)
+        )
+        _, _, rendered_principal_axes = np.linalg.svd(
+            centered_rendered_vertices, full_matrices=False,
+        )
+        rendered_canonical_axis = rendered_principal_axes[0]
 
     if init_frame in pose_archive_frames:
         init_frame_result = deepcopy(pose_archive_frames[init_frame])
@@ -2166,15 +2500,11 @@ def process_video(args):
                 )
                 hand_memory_pool_summary = hand_memory_provider.pool_summary()
             if args.pose_prior_mode in {"grasp_type", "hand_fusion"}:
-                mesh_vertices = np.asarray(init_trimesh.vertices, dtype=np.float64)
-                centered_vertices = mesh_vertices - mesh_vertices.mean(axis=0)
-                _, _, principal_axes = np.linalg.svd(centered_vertices, full_matrices=False)
-                canonical_axis = principal_axes[0]
                 grasp_type_provider = GraspTypePosePrior(
                     hand_sequence,
                     anchor_frame=hand_anchor_frame,
                     anchor_pose=hand_anchor_pose,
-                    canonical_axis=canonical_axis,
+                    canonical_axis=rendered_canonical_axis,
                     grasp_type=args.hand_grasp_type,
                 )
             if args.pose_prior_mode in {"hand_contact", "hand_fusion"}:
@@ -2193,7 +2523,7 @@ def process_video(args):
                     )
                 contact_provider = ContactConsistencyPrior(
                     hand_sequence,
-                    mesh_vertices=np.asarray(init_trimesh.vertices, dtype=np.float64),
+                    mesh_vertices=rendered_mesh_vertices,
                     pose_archive_path=args.pose_archive,
                     reference_frames=reference_frames,
                     sample_vertices=args.contact_sample_vertices,
@@ -2474,6 +2804,17 @@ def process_video(args):
             gt_mask=mask,
             occluder_mask=occluder_mask,
             occluder_dilation_px=args.occluder_dilation_px,
+            render_raw_iou_score_weight=args.render_raw_iou_score_weight,
+            component_balance_score_weight=args.component_balance_score_weight,
+            component_bridge_score_weight=args.component_bridge_score_weight,
+            component_min_area_px=args.component_min_area_px,
+            component_bridge_dilation_px=args.component_bridge_dilation_px,
+            component_axis_guidance=(
+                args.component_axis_guidance and hand_prior_in_range
+            ),
+            component_axis_base_pose=decoded_coarse_pose,
+            component_axis_rendered_canonical_axis=rendered_canonical_axis,
+            component_axis_depth_angles_deg=component_axis_depth_angles_deg,
             image_hw=image_hw,
             enable_shape_icp=args.enable_shape_icp,
             pose_selection=args.pose_selection,
@@ -2553,6 +2894,16 @@ def process_video(args):
             )
         if "grasp_axis_error_deg" in result:
             msg += f", axis_err={result['grasp_axis_error_deg']:.1f}deg"
+        if result.get("visible_component_count", 0) > 1:
+            recalls = "/".join(
+                f"{value:.2f}" for value in result["visible_component_recalls"]
+            )
+            msg += (
+                f", component_recall={recalls}"
+                f", bridge={result['occlusion_bridge_score']:.2f}"
+            )
+        if "component_axis_depth_angle_deg" in result:
+            msg += f", mask_axis_depth={result['component_axis_depth_angle_deg']:.0f}deg"
         logger.info(msg)
 
         all_results[frame_idx] = result
@@ -2638,6 +2989,13 @@ def process_video(args):
         "occluder_masks_root": args.occluder_masks_root,
         "occluder_mask_names": occluder_mask_names,
         "occluder_dilation_px": args.occluder_dilation_px,
+        "render_raw_iou_score_weight": args.render_raw_iou_score_weight,
+        "component_balance_score_weight": args.component_balance_score_weight,
+        "component_bridge_score_weight": args.component_bridge_score_weight,
+        "component_min_area_px": args.component_min_area_px,
+        "component_bridge_dilation_px": args.component_bridge_dilation_px,
+        "component_axis_guidance": args.component_axis_guidance,
+        "component_axis_depth_angles_deg": component_axis_depth_angles_deg,
         "pose_selection": args.pose_selection,
         "cluster_dist_thresh": args.cluster_dist_thresh if args.pose_selection == "cluster" else None,
         "cluster_min_size": args.cluster_min_size if args.pose_selection == "cluster" else None,
@@ -2711,6 +3069,22 @@ def main():
                         help="Comma-separated occluder mask names used as ignored regions for render IoU")
     parser.add_argument("--occluder_dilation_px", type=int, default=0,
                         help="Dilate combined occluder mask by this many pixels before render IoU scoring")
+    parser.add_argument("--render_raw_iou_score_weight", type=float, default=0.0,
+                        help="Additional candidate reward for full, non-occlusion-masked silhouette IoU")
+    parser.add_argument("--component_balance_score_weight", type=float, default=0.0,
+                        help="Reward the minimum recall across all visible object-mask components")
+    parser.add_argument("--component_bridge_score_weight", type=float, default=0.0,
+                        help="Reward one rendered silhouette connecting visible components through the occluder")
+    parser.add_argument("--component_min_area_px", type=int, default=20,
+                        help="Minimum object-mask connected-component area used by balanced scoring")
+    parser.add_argument("--component_bridge_dilation_px", type=int, default=2,
+                        help="Small boundary tolerance used only for the occlusion bridge test")
+    parser.add_argument("--component_axis_guidance", action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="Generate diffusion pose modes from the line joining the two largest visible mask components")
+    parser.add_argument("--component_axis_depth_angles_deg",
+                        default="-70,-50,-30,-10,0,10,30,50,70",
+                        help="Comma-separated object-axis depth angles for component-axis pose modes")
     parser.add_argument("--mesh", default=None, help="Override init mesh path")
     parser.add_argument("--output_dir", default="guided_pose_output", help="Output directory")
     parser.add_argument("--device", default="cuda", help="Device")

@@ -241,6 +241,20 @@ For a full timeline, limit these constraints to the actual hand-interaction
 segment with `--hand_prior_start_frame` / `--hand_prior_end_frame`; frames
 outside that interval fall back to ordinary image-conditioned pose chaining.
 
+For masks split into multiple visible pieces by a hand, component-aware
+scoring prevents the smaller piece from disappearing inside an area-weighted
+IoU. `--component_balance_score_weight` rewards the minimum recall over all
+visible components, while `--component_bridge_score_weight` requires one full
+rendered silhouette to connect them through the hand region. The component
+terms use the raw hand mask rather than the dilated IoU-ignore mask.
+
+`--component_axis_guidance` also turns the line joining the two largest mask
+components into explicit diffusion pose modes. Its comma-separated
+`--component_axis_depth_angles_deg` keeps the unresolved out-of-image-plane
+tilt multimodal. The canonical object axis is measured after the same Y-up to
+Z-up conversion used by the silhouette renderer, so hand and mask constraints
+act on the axis that is actually projected.
+
 Example for a left-hand power hold with a four-frame contact window:
 
 ```bash
@@ -261,6 +275,17 @@ python track_object.py ... \
     --prior_rotation_score_weight 0.08 \
     --contact_consistency_score_weight 0.20 \
     --grasp_axis_score_weight 0.10
+```
+
+Example additions for a hand-occluded object split into two components:
+
+```bash
+    --render_raw_iou_score_weight 0.25 \
+    --component_balance_score_weight 0.60 \
+    --component_bridge_score_weight 0.30 \
+    --component_min_area_px 20 \
+    --component_axis_guidance \
+    --component_axis_depth_angles_deg=-70,-50,-30,-10,0,10,30,50,70
 ```
 
 ### Quick Start/Object Generation
