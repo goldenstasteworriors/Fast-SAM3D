@@ -536,6 +536,7 @@ def _component_axis_pose_hypotheses(
     intrinsics_3x3,
     image_hw,
     rendered_canonical_axis,
+    rendered_axis_extent,
     depth_angles_deg,
     min_area_px=20,
 ):
@@ -547,7 +548,12 @@ def _component_axis_pose_hypotheses(
     small fragment cannot be overwhelmed by the large one.
     """
     diagnostics = {"active": False, "reason": "insufficient_components"}
-    if base_pose is None or gt_mask is None or rendered_canonical_axis is None:
+    if (
+        base_pose is None
+        or gt_mask is None
+        or rendered_canonical_axis is None
+        or rendered_axis_extent is None
+    ):
         return [], diagnostics
 
     gt_binary = np.asarray(gt_mask) > 0
@@ -567,6 +573,17 @@ def _component_axis_pose_hypotheses(
     image_direction = second[1] - first[1]
     if float(np.linalg.norm(image_direction)) < 2.0:
         diagnostics["reason"] = "degenerate_component_direction"
+        return [], diagnostics
+    image_direction_unit = image_direction / np.linalg.norm(image_direction)
+    visible_y, visible_x = np.nonzero(gt_binary)
+    visible_coordinates = np.stack([visible_x, visible_y], axis=1).astype(np.float64)
+    visible_axis_coordinates = visible_coordinates @ image_direction_unit
+    observed_axis_span_px = float(
+        np.percentile(visible_axis_coordinates, 99.0)
+        - np.percentile(visible_axis_coordinates, 1.0)
+    )
+    if observed_axis_span_px < 4.0:
+        diagnostics["reason"] = "degenerate_component_span"
         return [], diagnostics
 
     height, width = image_hw
@@ -599,16 +616,13 @@ def _component_axis_pose_hypotheses(
     source_axis = base_rotation.T @ canonical_axis
 
     translation = base_translation_tensor.reshape(-1, 3)[0].numpy().astype(np.float64)
+    base_scale = float(base_pose["scale"].detach().cpu().reshape(-1)[0])
     target_center = 0.5 * (first[1] + second[1])
-    z = max(float(translation[2]), 1e-4)
-    projected_u = cx - fx * float(translation[0]) / z
-    projected_v = cy - fy * float(translation[1]) / z
-    recentered_translation = translation.copy()
-    recentered_translation[0] -= (target_center[0] - projected_u) * z / max(fx, 1e-8)
-    recentered_translation[1] -= (target_center[1] - projected_v) * z / max(fy, 1e-8)
+    base_z = max(float(translation[2]), 1e-4)
 
     hypotheses = []
     target_axes = []
+    target_depths = []
     for depth_angle_deg in depth_angles_deg:
         angle = float(np.deg2rad(depth_angle_deg))
         target_axis = (
@@ -618,6 +632,23 @@ def _component_axis_pose_hypotheses(
         target_axis /= max(float(np.linalg.norm(target_axis)), 1e-12)
         delta = _align_vector_rotation(source_axis, target_axis)
         rotation = base_rotation @ delta.T
+        projected_axis_pixels_per_metre = float(
+            np.hypot(fx * target_axis[0], fy * target_axis[1])
+        )
+        target_z = (
+            base_scale
+            * float(rendered_axis_extent)
+            * projected_axis_pixels_per_metre
+            / observed_axis_span_px
+        )
+        # The visible span contains transverse thickness as well as the main
+        # axis.  Keep the geometric estimate soft but allow the substantial
+        # depth correction required by transparent-object point-map failures.
+        target_z = float(np.clip(target_z, 0.45 * base_z, 1.25 * base_z))
+        target_translation = translation.copy()
+        target_translation[0] = (cx - target_center[0]) * target_z / max(fx, 1e-8)
+        target_translation[1] = (cy - target_center[1]) * target_z / max(fy, 1e-8)
+        target_translation[2] = target_z
         quaternion = ScipyRotation.from_matrix(rotation).as_quat(scalar_first=True)
         hypothesis = copy_pose(base_pose)
         hypothesis["rotation"] = torch.as_tensor(
@@ -625,11 +656,12 @@ def _component_axis_pose_hypotheses(
             dtype=base_rotation_tensor.dtype,
         ).reshape(base_rotation_tensor.shape)
         hypothesis["translation"] = torch.as_tensor(
-            recentered_translation,
+            target_translation,
             dtype=base_translation_tensor.dtype,
         ).reshape(base_translation_tensor.shape)
         hypotheses.append(hypothesis)
         target_axes.append(target_axis.tolist())
+        target_depths.append(target_z)
 
     diagnostics = {
         "active": bool(hypotheses),
@@ -639,8 +671,10 @@ def _component_axis_pose_hypotheses(
             np.rad2deg(np.arctan2(image_direction[1], image_direction[0]))
         ),
         "target_center": target_center.tolist(),
+        "observed_axis_span_px": observed_axis_span_px,
         "depth_angles_deg": [float(value) for value in depth_angles_deg],
         "target_axes": target_axes,
+        "target_depths": target_depths,
     }
     return hypotheses, diagnostics
 
@@ -1486,6 +1520,7 @@ def guided_predict_pose(
     component_axis_guidance=False,
     component_axis_base_pose=None,
     component_axis_rendered_canonical_axis=None,
+    component_axis_rendered_axis_extent=None,
     component_axis_depth_angles_deg=None,
     image_hw=None,
     enable_shape_icp=True,
@@ -1550,6 +1585,7 @@ def guided_predict_pose(
                 intrinsics.squeeze(),
                 image_hw,
                 component_axis_rendered_canonical_axis,
+                component_axis_rendered_axis_extent,
                 angles,
                 min_area_px=component_min_area_px,
             )
@@ -2298,6 +2334,7 @@ def process_video(args):
     )
     rendered_mesh_vertices = None
     rendered_canonical_axis = None
+    rendered_canonical_axis_extent = None
     if init_trimesh is not None:
         rendered_mesh_vertices = (
             np.asarray(init_trimesh.vertices, dtype=np.float64)
@@ -2310,6 +2347,12 @@ def process_video(args):
             centered_rendered_vertices, full_matrices=False,
         )
         rendered_canonical_axis = rendered_principal_axes[0]
+        rendered_axis_coordinates = (
+            rendered_mesh_vertices @ rendered_canonical_axis
+        )
+        rendered_canonical_axis_extent = float(
+            np.ptp(rendered_axis_coordinates)
+        )
 
     if init_frame in pose_archive_frames:
         init_frame_result = deepcopy(pose_archive_frames[init_frame])
@@ -2816,6 +2859,7 @@ def process_video(args):
             ),
             component_axis_base_pose=decoded_coarse_pose,
             component_axis_rendered_canonical_axis=rendered_canonical_axis,
+            component_axis_rendered_axis_extent=rendered_canonical_axis_extent,
             component_axis_depth_angles_deg=component_axis_depth_angles_deg,
             image_hw=image_hw,
             enable_shape_icp=args.enable_shape_icp,

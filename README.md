@@ -251,9 +251,11 @@ terms use the raw hand mask rather than the dilated IoU-ignore mask.
 `--component_axis_guidance` also turns the line joining the two largest mask
 components into explicit diffusion pose modes. Its comma-separated
 `--component_axis_depth_angles_deg` keeps the unresolved out-of-image-plane
-tilt multimodal. The canonical object axis is measured after the same Y-up to
-Z-up conversion used by the silhouette renderer, so hand and mask constraints
-act on the axis that is actually projected.
+tilt multimodal. Each mode also infers depth and image-plane translation from
+the observed component span while preserving the fixed mesh scale. The
+canonical object axis is measured after the same Y-up to Z-up conversion used
+by the silhouette renderer, so hand and mask constraints act on the axis that
+is actually projected.
 
 Example for a left-hand power hold with a four-frame contact window:
 
