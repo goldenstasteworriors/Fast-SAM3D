@@ -594,7 +594,9 @@ def _component_axis_pose_hypotheses(
     ).as_matrix()
     canonical_axis = np.asarray(rendered_canonical_axis, dtype=np.float64)
     canonical_axis /= max(float(np.linalg.norm(canonical_axis)), 1e-12)
-    source_axis = base_rotation @ canonical_axis
+    # PyTorch3D Transform3d uses row vectors: v_camera = v_object @ R + t.
+    # In column notation the rendered axis is therefore R.T @ axis.
+    source_axis = base_rotation.T @ canonical_axis
 
     translation = base_translation_tensor.reshape(-1, 3)[0].numpy().astype(np.float64)
     target_center = 0.5 * (first[1] + second[1])
@@ -615,7 +617,7 @@ def _component_axis_pose_hypotheses(
         )
         target_axis /= max(float(np.linalg.norm(target_axis)), 1e-12)
         delta = _align_vector_rotation(source_axis, target_axis)
-        rotation = delta @ base_rotation
+        rotation = base_rotation @ delta.T
         quaternion = ScipyRotation.from_matrix(rotation).as_quat(scalar_first=True)
         hypothesis = copy_pose(base_pose)
         hypothesis["rotation"] = torch.as_tensor(

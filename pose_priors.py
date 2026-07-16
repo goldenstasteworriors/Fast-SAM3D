@@ -129,6 +129,26 @@ def matrix_to_pose(matrix: np.ndarray, scale: Any) -> dict[str, torch.Tensor]:
     }
 
 
+def _apply_camera_motion_to_render_pose(
+    motion: np.ndarray,
+    pose: dict[str, Any],
+) -> np.ndarray:
+    """Apply camera-space motion to a pose rendered with row-vector rotation.
+
+    PyTorch3D ``Transform3d`` maps object points as ``v @ R + t``.  A camera
+    motion fitted as ``D @ p + d`` must consequently update the stored pose as
+    ``R_new = R @ D.T`` and ``t_new = D @ t + d``.  Left-multiplying two
+    conventional column-vector pose matrices rotates the wrong object axis.
+    """
+    pose_matrix = pose_to_matrix(pose)
+    result = np.eye(4, dtype=np.float64)
+    result[:3, :3] = pose_matrix[:3, :3] @ motion[:3, :3].T
+    result[:3, 3] = (
+        motion[:3, :3] @ pose_matrix[:3, 3] + motion[:3, 3]
+    )
+    return result
+
+
 def pose_errors(pose: dict[str, Any], reference: dict[str, Any]) -> tuple[float, float]:
     pose_matrix = pose_to_matrix(pose)
     reference_matrix = pose_to_matrix(reference)
@@ -1205,7 +1225,9 @@ class HandMotionPosePrior:
         diagnostics["grasp"] = analysis
         if motion is None:
             return None, [], diagnostics
-        predicted_matrix = motion @ pose_to_matrix(self.anchor_pose)
+        predicted_matrix = _apply_camera_motion_to_render_pose(
+            motion, self.anchor_pose
+        )
         scale = coarse_pose["scale"] if coarse_pose is not None else self.anchor_pose["scale"]
         predicted = matrix_to_pose(predicted_matrix, scale)
         if coarse_pose is not None and self.coarse_blend_weight > 0.0:
@@ -1395,7 +1417,7 @@ class GraspMemoryPosePrior:
             fit_diagnostics[memory.frame_idx] = fit
             if motion is None:
                 continue
-            matrix = motion @ pose_to_matrix(memory.pose)
+            matrix = _apply_camera_motion_to_render_pose(motion, memory.pose)
             scale = coarse_pose["scale"] if coarse_pose is not None else memory.pose["scale"]
             priors.append(matrix_to_pose(matrix, scale))
             used_frames.append(memory.frame_idx)
@@ -1543,7 +1565,9 @@ class GraspTypePosePrior:
             motion = target_frame @ np.linalg.inv(anchor_frame)
             diagnostics["constraint"] = f"{target_analysis['type']}_interaction_frame"
 
-        predicted_matrix = motion @ pose_to_matrix(self.anchor_pose)
+        predicted_matrix = _apply_camera_motion_to_render_pose(
+            motion, self.anchor_pose
+        )
         scale = coarse_pose["scale"] if coarse_pose is not None else self.anchor_pose["scale"]
         predicted = matrix_to_pose(predicted_matrix, scale)
 
@@ -1552,9 +1576,9 @@ class GraspTypePosePrior:
         for angle in (0.0, 0.5 * np.pi, np.pi, 1.5 * np.pi):
             symmetry = Rotation.from_rotvec(self.canonical_axis * angle).as_matrix()
             hypothesis = predicted_matrix.copy()
-            hypothesis[:3, :3] = predicted_matrix[:3, :3] @ symmetry
+            hypothesis[:3, :3] = symmetry.T @ predicted_matrix[:3, :3]
             priors.append(matrix_to_pose(hypothesis, scale))
-        target_axis = predicted_matrix[:3, :3] @ self.canonical_axis
+        target_axis = predicted_matrix[:3, :3].T @ self.canonical_axis
         axis_context = {
             "canonical_axis": self.canonical_axis.copy(),
             "target_axis": target_axis,
@@ -1572,7 +1596,7 @@ def grasp_axis_score(
     transform = pose_to_matrix(pose)
     canonical = np.asarray(context["canonical_axis"], dtype=np.float64)
     target = _safe_unit(np.asarray(context["target_axis"], dtype=np.float64))
-    predicted = _safe_unit(transform[:3, :3] @ canonical)
+    predicted = _safe_unit(transform[:3, :3].T @ canonical)
     if target is None or predicted is None:
         return 0.0, 180.0
     # A transparent beaker is nearly symmetric under axis reversal in
@@ -1634,7 +1658,7 @@ class ContactConsistencyPrior:
             scale = float(_as_numpy(pose["scale"]).reshape(-1)[0])
             object_points = (
                 self.canonical_vertices * scale
-            ) @ matrix[:3, :3].T + matrix[:3, 3]
+            ) @ matrix[:3, :3] + matrix[:3, 3]
             distances = np.linalg.norm(
                 reference_points[:, None, :] - object_points[None, :, :], axis=2
             )
@@ -1665,7 +1689,7 @@ def contact_consistency_score(
     hand_points = np.asarray(context["current_hand_points"], dtype=np.float64)
     matrix = pose_to_matrix(pose)
     scale = float(_as_numpy(pose["scale"]).reshape(-1)[0])
-    object_points = canonical * scale @ matrix[:3, :3].T + matrix[:3, 3]
+    object_points = canonical * scale @ matrix[:3, :3] + matrix[:3, 3]
     distances = np.linalg.norm(
         hand_points[:, None, :] - object_points[None, :, :], axis=2
     )
