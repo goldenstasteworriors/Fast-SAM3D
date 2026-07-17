@@ -1546,6 +1546,8 @@ def guided_predict_pose(
     grasp_axis_context=None,
     grasp_axis_score_weight=0.0,
     grasp_axis_sigma_deg=20.0,
+    pose_target_labels=None,
+    preserve_pose_targets_with_component_axis=False,
 ):
     # Preprocess (once -- independent of seed)
     pointmap_dict = pipeline.compute_pointmap(rgba)
@@ -1567,6 +1569,26 @@ def guided_predict_pose(
                 dm_output = pipeline.depth_model(loaded_img_t)
         intrinsics = dm_output["intrinsics"].detach().cpu()
 
+    base_pose_targets = []
+    if pose_target is not None:
+        base_pose_targets = (
+            list(pose_target)
+            if isinstance(pose_target, (list, tuple))
+            else [pose_target]
+        )
+    if pose_target_labels is None:
+        base_pose_target_labels = [
+            f"pose_target_{index}" for index in range(len(base_pose_targets))
+        ]
+    else:
+        base_pose_target_labels = list(pose_target_labels)
+        if len(base_pose_target_labels) != len(base_pose_targets):
+            raise ValueError(
+                "pose_target_labels must have the same length as pose targets"
+            )
+
+    effective_pose_target_labels = list(base_pose_target_labels)
+    component_axis_target_offset = None
     component_axis_hypotheses = []
     component_axis_diagnostics = {"active": False, "reason": "disabled"}
     if component_axis_guidance:
@@ -1591,15 +1613,27 @@ def guided_predict_pose(
             )
         )
         if component_axis_hypotheses:
-            # Replace image-ambiguous hand hypotheses.  Each depth angle now
-            # receives diffusion samples instead of being considered only in
-            # post-hoc scoring.
-            pose_target = component_axis_hypotheses
+            component_labels = [
+                f"component_axis_{float(angle):g}deg"
+                for angle in component_axis_diagnostics["depth_angles_deg"]
+            ]
+            if preserve_pose_targets_with_component_axis and base_pose_targets:
+                component_axis_target_offset = len(base_pose_targets)
+                pose_target = base_pose_targets + component_axis_hypotheses
+                effective_pose_target_labels = (
+                    base_pose_target_labels + component_labels
+                )
+            else:
+                component_axis_target_offset = 0
+                pose_target = component_axis_hypotheses
+                effective_pose_target_labels = component_labels
             logger.info(
                 "  Component-axis guidance: "
                 f"{len(component_axis_hypotheses)} modes, "
                 f"image_angle={component_axis_diagnostics['image_axis_angle_deg']:.1f}deg"
             )
+
+    effective_pose_target_count = len(effective_pose_target_labels)
 
     # Build renderer once for render_iou scoring
     frame_renderer = None
@@ -1689,6 +1723,10 @@ def guided_predict_pose(
             "sample_seed": sample_seed,
             "x1_latent": x1_latent,
         }
+        if effective_pose_target_count:
+            guide_index = k % effective_pose_target_count
+            result["pose_guide_hypothesis"] = guide_index
+            result["pose_guide_label"] = effective_pose_target_labels[guide_index]
 
         # Compute render IoU if requested
         if scoring_metric == "render_iou" and render_mesh is not None and gt_mask is not None:
@@ -1725,14 +1763,15 @@ def guided_predict_pose(
             result["visible_component_recalls"] = riou_details["component_recalls"]
             result["visible_component_balance"] = riou_details["component_balance"]
             result["occlusion_bridge_score"] = riou_details["component_bridge"]
-            if component_axis_hypotheses:
-                result["component_axis_hypothesis"] = (
-                    k % len(component_axis_hypotheses)
-                )
-                result["component_axis_depth_angle_deg"] = float(
-                    component_axis_diagnostics["depth_angles_deg"]
-                    [result["component_axis_hypothesis"]]
-                )
+            if component_axis_target_offset is not None:
+                guide_index = result["pose_guide_hypothesis"]
+                component_index = guide_index - component_axis_target_offset
+                if 0 <= component_index < len(component_axis_hypotheses):
+                    result["component_axis_hypothesis"] = component_index
+                    result["component_axis_depth_angle_deg"] = float(
+                        component_axis_diagnostics["depth_angles_deg"]
+                        [component_index]
+                    )
 
         # Score selection.  Render IoU remains the image evidence; optional
         # hand/history terms only act as soft priors on candidate ranking.
@@ -2187,6 +2226,43 @@ def process_video(args):
         logger.info(
             f"Loaded pose archive with {len(pose_archive_frames)} frames: "
             f"{args.pose_archive}"
+        )
+
+    bidirectional_guide_frames = {}
+    if args.bidirectional_guide_archive is not None:
+        if not os.path.isfile(args.bidirectional_guide_archive):
+            logger.error(
+                "Bidirectional guide archive not found: "
+                f"{args.bidirectional_guide_archive}"
+            )
+            return
+        if args.bidirectional_contact_start_frame is None:
+            logger.error(
+                "--bidirectional_guide_archive requires "
+                "--bidirectional_contact_start_frame so a future contact pose "
+                "cannot leak into known non-contact frames"
+            )
+            return
+        if (
+            args.bidirectional_contact_end_frame is not None
+            and args.bidirectional_contact_end_frame
+            <= args.bidirectional_contact_start_frame
+        ):
+            logger.error(
+                "--bidirectional_contact_end_frame must be greater than "
+                "--bidirectional_contact_start_frame"
+            )
+            return
+        bidirectional_guide_frames, _ = load_pose_archive(
+            args.bidirectional_guide_archive
+        )
+        logger.info(
+            "Loaded opposite-direction guide archive with "
+            f"{len(bidirectional_guide_frames)} frames: "
+            f"{args.bidirectional_guide_archive}; "
+            f"pass={args.bidirectional_guide_pass}, "
+            f"contact_range=[{args.bidirectional_contact_start_frame}, "
+            f"{args.bidirectional_contact_end_frame})"
         )
 
     if (
@@ -2786,6 +2862,71 @@ def process_video(args):
                 candidate_pose_priors
             )
 
+        frame_pose_targets = (
+            list(frame_pose_target)
+            if isinstance(frame_pose_target, (list, tuple))
+            else ([frame_pose_target] if frame_pose_target is not None else [])
+        )
+        if len(frame_pose_targets) == 1:
+            frame_pose_target_labels = [f"{pass_name}_chain"]
+        else:
+            frame_pose_target_labels = [
+                f"{pass_name}_pose_target_{index}"
+                for index in range(len(frame_pose_targets))
+            ]
+
+        bidirectional_guide_diagnostics = {
+            "active": False,
+            "reason": "disabled",
+        }
+        if bidirectional_guide_frames:
+            pass_matches = (
+                args.bidirectional_guide_pass == "both"
+                or args.bidirectional_guide_pass == pass_name
+            )
+            in_contact_range = (
+                frame_idx >= args.bidirectional_contact_start_frame
+                and (
+                    args.bidirectional_contact_end_frame is None
+                    or frame_idx < args.bidirectional_contact_end_frame
+                )
+            )
+            opposite_result = bidirectional_guide_frames.get(frame_idx)
+            if not pass_matches:
+                bidirectional_guide_diagnostics["reason"] = "pass_not_enabled"
+            elif not in_contact_range:
+                bidirectional_guide_diagnostics["reason"] = "outside_contact_range"
+            elif opposite_result is None:
+                bidirectional_guide_diagnostics["reason"] = "archive_frame_missing"
+            else:
+                opposite_pose = result_to_pose(opposite_result)
+                opposite_label = (
+                    "backward_archive"
+                    if pass_name == "forward"
+                    else "forward_archive"
+                )
+                frame_pose_targets.append(opposite_pose)
+                frame_pose_target_labels.append(opposite_label)
+                frame_pose_target = frame_pose_targets
+                bidirectional_guide_diagnostics = {
+                    "active": True,
+                    "reason": "contact_range",
+                    "opposite_guide_label": opposite_label,
+                    "pose_hypotheses": len(frame_pose_targets),
+                    "archive": args.bidirectional_guide_archive,
+                }
+                logger.info(
+                    "  Bidirectional pose guidance: "
+                    f"labels={frame_pose_target_labels}"
+                )
+
+        if not bidirectional_guide_diagnostics["active"]:
+            frame_pose_target = (
+                frame_pose_targets
+                if len(frame_pose_targets) > 1
+                else (frame_pose_targets[0] if frame_pose_targets else None)
+            )
+
         if args.pose_prior_mode != "none":
             logger.info(
                 "  Pose prior: "
@@ -2885,11 +3026,18 @@ def process_video(args):
             grasp_axis_context=grasp_axis_context,
             grasp_axis_score_weight=args.grasp_axis_score_weight,
             grasp_axis_sigma_deg=args.grasp_axis_sigma_deg,
+            pose_target_labels=frame_pose_target_labels,
+            preserve_pose_targets_with_component_axis=(
+                bidirectional_guide_diagnostics["active"]
+            ),
         )
 
         torch.cuda.synchronize()
         result["frame_time_s"] = time.perf_counter() - _t0
         result["pose_prior_diagnostics"] = pose_prior_diagnostics
+        result["bidirectional_guide_diagnostics"] = (
+            bidirectional_guide_diagnostics
+        )
         result.pop("x1_latent", None)  # strip large latent before saving
 
         # Save all K samples to a separate file
@@ -2929,6 +3077,8 @@ def process_video(args):
                 msg += f", render_IoU={result['render_iou']:.4f}"
         if "selection_score" in result:
             msg += f", selection={result['selection_score']:.4f}"
+        if "pose_guide_label" in result:
+            msg += f", guide={result['pose_guide_label']}"
         if "pose_prior_rotation_error_deg" in result:
             msg += f", prior_R_err={result['pose_prior_rotation_error_deg']:.1f}deg"
         if "history_alignment_median_m" in result:
@@ -3053,6 +3203,12 @@ def process_video(args):
         "batch_chunk_size": args.batch_chunk_size,
         "pose_prior_mode": args.pose_prior_mode,
         "pose_archive": args.pose_archive,
+        "bidirectional_guide_archive": args.bidirectional_guide_archive,
+        "bidirectional_guide_pass": args.bidirectional_guide_pass,
+        "bidirectional_contact_range": [
+            args.bidirectional_contact_start_frame,
+            args.bidirectional_contact_end_frame,
+        ],
         "hand_meshes": args.hand_meshes,
         "hand_side": (
             args.hand_side
@@ -3148,6 +3304,39 @@ def main():
                         help="Path to .pt file with target pose")
     parser.add_argument("--pose_archive", default=None,
                         help="Existing guided_poses.pt used for a non-layout init frame and prior anchors/keyframes")
+    parser.add_argument(
+        "--bidirectional_guide_archive",
+        default=None,
+        help=(
+            "Pose archive produced by the opposite tracking direction. "
+            "Its per-frame pose is added as a separate diffusion mode only "
+            "inside the configured contact range."
+        ),
+    )
+    parser.add_argument(
+        "--bidirectional_guide_pass",
+        default="forward",
+        choices=["forward", "backward", "both"],
+        help="Tracking pass on which to add the opposite-direction guide.",
+    )
+    parser.add_argument(
+        "--bidirectional_contact_start_frame",
+        type=int,
+        default=None,
+        help=(
+            "First contact frame receiving the opposite-direction pose mode. "
+            "Frames before it use only the causal chain."
+        ),
+    )
+    parser.add_argument(
+        "--bidirectional_contact_end_frame",
+        type=int,
+        default=None,
+        help=(
+            "Exclusive end of the contact interval; defaults to the end of "
+            "the processed video."
+        ),
+    )
     parser.add_argument("--pose_prior_mode", default="none",
                         choices=[
                             "none", "hand", "history", "hand_motion",
