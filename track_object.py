@@ -119,6 +119,7 @@ from pose_priors import (
     HandMotionPosePrior,
     HistoryMemoryPosePrior,
     ManoHandSequence,
+    PicoHandChainPosePrior,
     contact_consistency_score,
     copy_pose,
     grasp_axis_score,
@@ -2206,6 +2207,18 @@ def process_video(args):
         if not args.pose_archive:
             logger.error(f"--pose_prior_mode {args.pose_prior_mode} requires --pose_archive")
             return
+    if args.pose_prior_mode == "pico_hand_chain":
+        if not args.chain_poses:
+            logger.error("--pose_prior_mode pico_hand_chain requires --chain_poses")
+            return
+        if not args.pico_hand_pose_npz:
+            logger.error(
+                "--pose_prior_mode pico_hand_chain requires --pico_hand_pose_npz"
+            )
+            return
+        if not os.path.isfile(args.pico_hand_pose_npz):
+            logger.error(f"PICO hand pose archive not found: {args.pico_hand_pose_npz}")
+            return
 
     # ---- Load pipeline (Fast-SAM3D style) ----
     logger.info("Loading pipeline...")
@@ -2421,6 +2434,7 @@ def process_video(args):
     hand_memory_provider = None
     grasp_type_provider = None
     contact_provider = None
+    pico_hand_chain_provider = None
     history_pool_summary = None
     hand_memory_pool_summary = None
 
@@ -2590,6 +2604,22 @@ def process_video(args):
                     for item in hand_memory_pool_summary
                 )
             )
+    elif args.pose_prior_mode == "pico_hand_chain":
+        try:
+            pico_hand_chain_provider = PicoHandChainPosePrior(
+                args.pico_hand_pose_npz,
+                hand=args.hand_side,
+            )
+        except (OSError, KeyError, ValueError, IndexError) as exc:
+            logger.error(f"Failed to initialize pico_hand_chain: {exc}")
+            return
+        logger.info(
+            f"Sequential PICO hand/SAM3D prior: hand={args.hand_side}, "
+            f"poses={args.pico_hand_pose_npz}, "
+            f"contact=[{args.hand_prior_start_frame}, "
+            f"{args.hand_prior_end_frame}), "
+            f"freeze_outside={args.freeze_outside_hand_range}"
+        )
 
     render_mesh = None
     image_hw = None
@@ -2617,7 +2647,9 @@ def process_video(args):
     all_results = {}
     processed_count = [0]
 
-    def _process_single_frame(frame_idx, pose_target, pass_name):
+    def _process_single_frame(
+        frame_idx, pose_target, pass_name, pose_source_frame=None
+    ):
         processed_count[0] += 1
         fidx, image_path, mask_path = frame_lookup[frame_idx]
 
@@ -2682,7 +2714,26 @@ def process_video(args):
             (args.hand_prior_start_frame is None or frame_idx >= args.hand_prior_start_frame)
             and (args.hand_prior_end_frame is None or frame_idx < args.hand_prior_end_frame)
         )
-        if args.pose_prior_mode == "hand":
+        if args.pose_prior_mode == "pico_hand_chain":
+            if pose_source_frame is None or decoded_coarse_pose is None:
+                pose_prior_diagnostics = {
+                    "mode": "pico_hand_chain",
+                    "failure": "missing_chained_source_pose",
+                }
+            else:
+                prior_pose, priors, pose_prior_diagnostics = (
+                    pico_hand_chain_provider.estimate(
+                        pose_source_frame,
+                        frame_idx,
+                        decoded_coarse_pose,
+                        apply_hand_motion=hand_prior_in_range,
+                    )
+                )
+                if prior_pose is not None:
+                    frame_pose_target = prior_pose
+                    candidate_pose_prior = prior_pose
+                    candidate_pose_priors = priors
+        elif args.pose_prior_mode == "hand":
             prior_pose, pose_prior_diagnostics = pose_prior_provider.get_pose(frame_idx)
             if prior_pose is not None:
                 if args.hand_use_chain_translation and decoded_coarse_pose is not None:
@@ -2890,6 +2941,24 @@ def process_video(args):
         torch.cuda.synchronize()
         result["frame_time_s"] = time.perf_counter() - _t0
         result["pose_prior_diagnostics"] = pose_prior_diagnostics
+        if (
+            args.pose_prior_mode == "pico_hand_chain"
+            and args.freeze_outside_hand_range
+            and not hand_prior_in_range
+            and frame_pose_target is not None
+        ):
+            # SAM3D is still evaluated on every frame, but outside contact its
+            # correction is diagnostics-only.  The published/chained pose is
+            # the camera projection of one world-static object pose.
+            for key in ("rotation", "translation", "scale"):
+                if key in result:
+                    result[f"sam3d_unfrozen_{key}"] = result[key]
+                result[key] = frame_pose_target[key]
+                post_key = f"post_opt_{key}"
+                if post_key in result:
+                    result[f"sam3d_unfrozen_{post_key}"] = result[post_key]
+                    result[post_key] = frame_pose_target[key]
+            result["frozen_outside_hand_range"] = True
         result.pop("x1_latent", None)  # strip large latent before saving
 
         # Save all K samples to a separate file
@@ -2966,8 +3035,12 @@ def process_video(args):
 
         for frame_idx in backward_indices:
             if args.chain_poses:
-                bwd_pose_target_in_curr = _maybe_transform_pose(
-                    bwd_pose_target, bwd_pose_frame, frame_idx, extrinsics,
+                bwd_pose_target_in_curr = (
+                    bwd_pose_target
+                    if args.pose_prior_mode == "pico_hand_chain"
+                    else _maybe_transform_pose(
+                        bwd_pose_target, bwd_pose_frame, frame_idx, extrinsics,
+                    )
                 )
             elif extrinsics is not None and pose_target_from_file is not None:
                 bwd_pose_target_in_curr = _maybe_transform_pose(
@@ -2976,7 +3049,12 @@ def process_video(args):
             else:
                 bwd_pose_target_in_curr = bwd_pose_target
 
-            result = _process_single_frame(frame_idx, bwd_pose_target_in_curr, "backward")
+            result = _process_single_frame(
+                frame_idx,
+                bwd_pose_target_in_curr,
+                "backward",
+                pose_source_frame=bwd_pose_frame,
+            )
             if result is None:
                 continue
             if args.chain_poses:
@@ -2996,8 +3074,12 @@ def process_video(args):
 
         for frame_idx in forward_indices:
             if args.chain_poses:
-                fwd_pose_target_in_curr = _maybe_transform_pose(
-                    fwd_pose_target, fwd_pose_frame, frame_idx, extrinsics,
+                fwd_pose_target_in_curr = (
+                    fwd_pose_target
+                    if args.pose_prior_mode == "pico_hand_chain"
+                    else _maybe_transform_pose(
+                        fwd_pose_target, fwd_pose_frame, frame_idx, extrinsics,
+                    )
                 )
             elif extrinsics is not None and pose_target_from_file is not None:
                 fwd_pose_target_in_curr = _maybe_transform_pose(
@@ -3006,7 +3088,12 @@ def process_video(args):
             else:
                 fwd_pose_target_in_curr = fwd_pose_target
 
-            result = _process_single_frame(frame_idx, fwd_pose_target_in_curr, "forward")
+            result = _process_single_frame(
+                frame_idx,
+                fwd_pose_target_in_curr,
+                "forward",
+                pose_source_frame=fwd_pose_frame,
+            )
             if result is None:
                 continue
             if args.chain_poses:
@@ -3052,6 +3139,8 @@ def process_video(args):
         "torch_compile": args.torch_compile,
         "batch_chunk_size": args.batch_chunk_size,
         "pose_prior_mode": args.pose_prior_mode,
+        "pico_hand_pose_npz": args.pico_hand_pose_npz,
+        "freeze_outside_hand_range": args.freeze_outside_hand_range,
         "pose_archive": args.pose_archive,
         "hand_meshes": args.hand_meshes,
         "hand_side": (
@@ -3152,7 +3241,7 @@ def main():
                         choices=[
                             "none", "hand", "history", "hand_motion",
                             "hand_memory", "grasp_type", "hand_contact",
-                            "hand_fusion",
+                            "hand_fusion", "pico_hand_chain",
                         ],
                         help=(
                             "Additional pose prior. New hand modes provide active-joint "
@@ -3176,6 +3265,23 @@ def main():
     parser.add_argument("--hand_meshes", default=None,
                         help="HaWoR all_hand_meshes.npz")
     parser.add_argument("--hand_side", default="right", choices=["left", "right"])
+    parser.add_argument(
+        "--pico_hand_pose_npz",
+        default=None,
+        help=(
+            "Synchronized PICO archive containing camera_to_world and "
+            "<hand>_palm_to_world; required by pico_hand_chain."
+        ),
+    )
+    parser.add_argument(
+        "--freeze_outside_hand_range",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "In pico_hand_chain mode still run SAM3D outside the interaction "
+            "range, but publish and chain the world-static guide pose."
+        ),
+    )
     parser.add_argument("--hand_anchor_frame", type=int, default=None,
                         help="Reliable grasp frame defining T_hand_object; defaults to init frame")
     parser.add_argument("--hand_use_chain_translation", action=argparse.BooleanOptionalAction,

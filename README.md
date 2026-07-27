@@ -231,6 +231,13 @@ fallback.
 - `hand_contact`: `hand_motion` plus COP-style invariance of contact-joint to
   canonical-object-vertex distance signatures.
 - `hand_fusion`: grasp memory guidance with category-axis and contact scoring.
+- `pico_hand_chain`: a closed loop in which the previous frame's SAM3D result
+  is moved by the synchronized PICO palm increment and used as the next
+  frame's diffusion/selection guide. Camera and palm transforms come from the
+  same PICO world frame, avoiding a second camera-motion multiplication.
+  Outside `--hand_prior_start_frame` / `--hand_prior_end_frame`, the guide is
+  world-static. With the default `--freeze_outside_hand_range`, SAM3D still
+  runs for diagnostics but cannot move the published pose outside contact.
 
 By default, top-K memory poses and symmetry-equivalent grasp poses are not only
 used for final scoring: `--hand_multimodal_guidance` distributes diffusion
@@ -288,6 +295,18 @@ Example additions for a hand-occluded object split into two components:
     --component_min_area_px 20 \
     --component_axis_guidance \
     --component_axis_depth_angles_deg=-70,-50,-30,-10,0,10,30,50,70
+```
+
+Sequential PICO palm/SAM3D closed-loop additions:
+
+```bash
+    --pose_prior_mode pico_hand_chain \
+    --pico_hand_pose_npz /path/to/pico_camera_palm_robust.npz \
+    --hand_side right \
+    --hand_prior_start_frame 80 \
+    --hand_prior_end_frame 475 \
+    --chain_poses \
+    --freeze_outside_hand_range
 ```
 
 ### Quick Start/Object Generation

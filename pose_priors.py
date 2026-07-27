@@ -1242,6 +1242,124 @@ class HandMotionPosePrior:
 
 
 # ---------------------------------------------------------------------------
+# Sequential PICO palm-guided propagation
+# ---------------------------------------------------------------------------
+
+
+class PicoHandChainPosePrior:
+    """Propagate the previous SAM3D pose with a PICO palm increment.
+
+    PICO palm and camera transforms share one world frame.  SAM3D stores its
+    rendered rotation for row-vector points, so the stored rotation is
+    transposed when entering/leaving conventional column-vector SE(3).
+    """
+
+    def __init__(self, pose_npz_path: str | Path, hand: str = "right") -> None:
+        if hand not in {"left", "right"}:
+            raise ValueError(f"hand must be left or right, got {hand!r}")
+        data = np.load(pose_npz_path, allow_pickle=False)
+        palm_key = f"{hand}_palm_to_world"
+        if "camera_to_world" not in data:
+            raise KeyError("camera_to_world is missing from PICO pose archive")
+        if palm_key not in data:
+            raise KeyError(f"{palm_key} is missing from PICO pose archive")
+
+        self.camera_to_world = np.asarray(
+            data["camera_to_world"], dtype=np.float64
+        )
+        self.palm_to_world = np.asarray(data[palm_key], dtype=np.float64)
+        if self.camera_to_world.shape[1:] != (4, 4):
+            raise ValueError("camera_to_world must have shape [N, 4, 4]")
+        if self.palm_to_world.shape != self.camera_to_world.shape:
+            raise ValueError(
+                f"{palm_key} and camera_to_world must have the same shape"
+            )
+        if "frame_indices" in data:
+            frame_indices = np.asarray(data["frame_indices"], dtype=np.int64)
+        else:
+            frame_indices = np.arange(len(self.camera_to_world), dtype=np.int64)
+        if len(frame_indices) != len(self.camera_to_world):
+            raise ValueError("frame_indices and PICO transforms have different lengths")
+        self.frame_to_row = {
+            int(frame_idx): int(row)
+            for row, frame_idx in enumerate(frame_indices)
+        }
+        self.hand = hand
+        self.pose_npz_path = str(pose_npz_path)
+
+    def has_frame(self, frame_idx: int) -> bool:
+        return int(frame_idx) in self.frame_to_row
+
+    @staticmethod
+    def _render_pose_to_column_transform(
+        pose: dict[str, Any],
+    ) -> np.ndarray:
+        stored = pose_to_matrix(pose)
+        transform = stored.copy()
+        transform[:3, :3] = stored[:3, :3].T
+        return transform
+
+    @staticmethod
+    def _column_transform_to_render_pose(
+        transform: np.ndarray,
+        scale: Any,
+    ) -> dict[str, torch.Tensor]:
+        stored = transform.copy()
+        stored[:3, :3] = transform[:3, :3].T
+        return matrix_to_pose(stored, scale)
+
+    def estimate(
+        self,
+        source_frame: int,
+        target_frame: int,
+        source_pose: dict[str, Any],
+        apply_hand_motion: bool = True,
+    ) -> tuple[dict[str, torch.Tensor] | None, list[dict[str, torch.Tensor]], dict[str, Any]]:
+        diagnostics: dict[str, Any] = {
+            "mode": "pico_hand_chain",
+            "source_frame": int(source_frame),
+            "target_frame": int(target_frame),
+            "apply_hand_motion": bool(apply_hand_motion),
+        }
+        if not self.has_frame(source_frame) or not self.has_frame(target_frame):
+            diagnostics["failure"] = "frame_out_of_range"
+            return None, [], diagnostics
+
+        source_row = self.frame_to_row[int(source_frame)]
+        target_row = self.frame_to_row[int(target_frame)]
+        source_camera = self.camera_to_world[source_row]
+        target_camera = self.camera_to_world[target_row]
+        source_object_camera = self._render_pose_to_column_transform(source_pose)
+        source_object_world = source_camera @ source_object_camera
+
+        if apply_hand_motion:
+            source_palm = self.palm_to_world[source_row]
+            target_palm = self.palm_to_world[target_row]
+            palm_to_object = np.linalg.inv(source_palm) @ source_object_world
+            target_object_world = target_palm @ palm_to_object
+            palm_delta = target_palm @ np.linalg.inv(source_palm)
+            diagnostics["palm_rotation_delta_deg"] = float(
+                np.rad2deg(_rotation_angle(palm_delta[:3, :3]))
+            )
+            diagnostics["palm_translation_delta_m"] = float(
+                np.linalg.norm(palm_delta[:3, 3])
+            )
+        else:
+            # The object is physically static in the PICO world frame.  Only
+            # its camera-frame pose changes as the headset camera moves.
+            target_object_world = source_object_world
+
+        target_object_camera = np.linalg.inv(target_camera) @ target_object_world
+        predicted = self._column_transform_to_render_pose(
+            target_object_camera, source_pose["scale"]
+        )
+        diagnostics["predicted_translation"] = (
+            predicted["translation"].reshape(-1, 3)[0].tolist()
+        )
+        return predicted, [predicted], diagnostics
+
+
+# ---------------------------------------------------------------------------
 # Low-occlusion grasp-pose memory
 # ---------------------------------------------------------------------------
 
